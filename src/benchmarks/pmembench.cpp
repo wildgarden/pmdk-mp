@@ -1015,7 +1015,7 @@ remove_part_cb(struct part_file *pf, void *arg)
 {
 #ifdef RPMEM_AVAILABLE
 	if (pf->is_remote)
-		return rpmem_remove(pf->node_addr, pf->pool_desc,
+		return rpmem_remove(pf->node_addr, pf->rpool_desc,
 				    RPMEM_REMOVE_FORCE);
 #endif
 	const char *part_file = pf->path;
@@ -1363,7 +1363,7 @@ out_release_args:
 
 out_old_wd:
 	/* restore the original working directory */
-	if (wd != NULL) { /* Only if PMEMBENCH_DIR env var was defined */
+	if (wd != NULL) { /* Only if PMEMBENCH_DIR shrd var was defined */
 		if (chdir(old_wd)) {
 			perror("chdir(old_wd)");
 			ret = -1;

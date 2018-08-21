@@ -38,6 +38,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <float.h>
+#include <pthread.h>
 
 #include "queue.h"
 #include "heap.h"
@@ -50,11 +51,18 @@
 #include "container_seglists.h"
 #include "alloc_class.h"
 #include "os_thread.h"
+#include "lane.h"
+#include "inttypes.h"
+#include "sync.h"
 
 /* calculates the size of the entire run, including any additional chunks */
 #define SIZEOF_RUN(runp, size_idx) (sizeof(*run) + ((size_idx - 1) * CHUNKSIZE))
 
-#define MAX_RUN_LOCKS 1024
+/*
+ * XXX mp-mode -- increased to avoid contention (until proper lock distribution
+ * is implemented).
+ */
+#define MAX_RUN_LOCKS (MAX_CHUNK)
 
 /*
  * Arenas store the collection of buckets for allocation classes. Each thread
@@ -67,26 +75,89 @@ struct arena {
 	size_t nthreads;
 };
 
+/*
+ * This structure represents the shared heap runtime state
+ */
+struct heap_rt_shm {
+	os_mutex_t zone_trans_lock; /* needed when transiting to next zone */
+	os_mutex_t run_locks[MAX_RUN_LOCKS];
+
+	volatile unsigned zones_exhausted;
+};
+
 struct heap_rt {
 	struct alloc_class_collection *alloc_classes;
 
 	/* DON'T use these two variable directly! */
-	struct bucket *default_bucket;
+	struct bucket *default_bucket; /* per process */
 	struct arena *arenas;
 
+	/*
+	 * used to prevent region transitions while another thread is allocating
+	 *
+	 * states:
+	 * - 'shared' 		during allocation
+	 * - 'exclusive' 	region transition in progress
+	 *
+	 * we use a rwlock, instead of a condition variable, due to better
+	 * support from helgrind
+	 */
+	os_rwlock_t rwlock;
+
 	/* protects assignment of arenas */
-	os_mutex_t arenas_lock;
+	os_mutex_t arenas_lock; /* per process */
 
 	/* stores a pointer to one of the arenas */
 	os_tls_key_t thread_arena;
 
-	struct recycler *recyclers[MAX_ALLOCATION_CLASSES];
+	struct recycler *recyclers[MAX_ALLOCATION_CLASSES]; /* per process */
 
-	os_mutex_t run_locks[MAX_RUN_LOCKS];
 	unsigned max_zone;
-	unsigned zones_exhausted;
 	unsigned narenas;
+
+	/* pointer to the shared runtime state that lives in shared memory */
+	struct heap_rt_shm *shrd;
+
+	/*
+	 * currently all access happens either during boot or after the default
+	 * bucket is acquired  and thus there is no reason to lock
+	 */
+	unsigned active_zone_id;
+
+	/* region that is currently used for allocations */
+	struct zone_region *active_region;
+
+	/* registry shared */
+	struct registry *registry;
+
+	/* function used for locking mutexes (depending on mp-mode) */
+	lock_fn mtx_lock;
+	populate_bucket_fn populate_bucket;
+	reclaim_garbage_fn reclaim_garbage;
+
+	region_transiton_hold_shrd_fn region_trans_lock_shrd;
+	region_transiton_hold_excl_fn region_trans_lock_excl;
+	region_transiton_release_fn region_trans_release;
+
+	zone_transition_hold_fn zone_trans_hold;
+	zone_transition_release_fn zone_trans_release;
 };
+
+/*
+ * heap_memblock_from_act_region -- returns 1 in non-mp mode or if the
+ * given
+ * memory block belongs to the active region, 0 otherwise
+ */
+int
+heap_memblock_from_act_region(const struct memory_block *m)
+{
+	ASSERTne(m->heap->rt->active_region, NULL);
+	int ret = ((m->heap->mp_mode == 0) ||
+	    (m->heap->rt->active_zone_id == m->zone_id &&
+	    HEAP_CHUNK_FROM_REGION(m->heap->rt->active_region, m->chunk_id)));
+
+	return ret;
+}
 
 /*
  * heap_arena_init -- (internal) initializes arena instance
@@ -119,6 +190,17 @@ struct alloc_class *
 heap_get_best_class(struct palloc_heap *heap, size_t size)
 {
 	return alloc_class_by_alloc_size(heap->rt->alloc_classes, size);
+}
+
+/*
+ * heap_get_active_region -- (internal) returns the active region
+ */
+struct zone_region *
+heap_get_active_region(struct palloc_heap *heap)
+{
+	ASSERTne(heap->rt->active_region, NULL);
+
+	return heap->rt->active_region;
 }
 
 /*
@@ -180,8 +262,55 @@ heap_thread_arena(struct heap_rt *heap)
 }
 
 /*
+ * heap_ensure_huge_bucket_filled --
+ *	(internal) refills the default bucket if needed
+ */
+static int
+heap_ensure_huge_bucket_filled(struct palloc_heap *heap, struct bucket *bucket,
+	uint32_t units)
+{
+	LOG(3, "bucket %p", bucket);
+	int ret;
+	if ((ret = heap->rt->reclaim_garbage(heap, bucket, units)) == 0)
+		return 0;
+
+	if (ret != ENOMEM)
+		return ret;
+
+	if ((ret = heap->rt->populate_bucket(heap, bucket, units)) == 0)
+		return 0;
+
+	return ret;
+}
+
+static int
+heap_region_lock(struct palloc_heap *heap, struct zone_region *r)
+{
+	LOG(4, "lock %p id %"PRIu32 " offset %"PRIu32,
+		&r->lock, r->idx, r->offset);
+	ASSERTne(&r->lock, NULL);
+
+	if ((errno = heap_mutex_lock(heap, &r->lock))) {
+		ERR("!could not aquire region lock %p id %"PRIu32 " offset "
+		    "%"PRIu32, &r->lock, r->idx, r->offset);
+		return -1;
+	}
+
+	return 0;
+}
+
+static void
+heap_region_release(struct palloc_heap *heap, struct zone_region *r)
+{
+	LOG(4, "release region lock %p", &r->lock);
+	util_mutex_unlock(&r->lock);
+}
+
+/*
  * heap_bucket_acquire_by_id -- fetches by id a bucket exclusive for the thread
  *	until heap_bucket_release is called
+ *
+ *	returns NULL when a locking error occured and sets errno appropriately
  */
 struct bucket *
 heap_bucket_acquire_by_id(struct palloc_heap *heap, uint8_t class_id)
@@ -198,12 +327,279 @@ heap_bucket_acquire_by_id(struct palloc_heap *heap, uint8_t class_id)
 
 	util_mutex_lock(&b->lock);
 
+	/*
+	 * lock our active region shared lock in case the default bucket was
+	 * acquired. This prevents races with other processes, which free
+	 * blocks from our regions.
+	 */
+	if (heap->mp_mode && class_id == DEFAULT_ALLOC_CLASS_ID) {
+		if (heap_region_lock(heap, heap->rt->active_region)) {
+			goto err;
+		}
+	}
+
 	return b;
+
+err:
+	util_mutex_unlock(&b->lock);
+	LOG(4, "heap_bucket_acquire_by_id %s", strerror(errno));
+
+	return NULL;
+}
+
+/*
+ * heap_region_trans_lock_shrd -- while this lock is held by any thread,
+ * it is not allowed to change the active region
+ */
+void
+heap_region_trans_lock_shrd(struct palloc_heap *heap)
+{
+	heap->rt->region_trans_lock_shrd(heap);
+}
+
+/*
+ * heap_region_trans_release -- release the lock
+ */
+void
+heap_region_trans_release(struct palloc_heap *heap)
+{
+	heap->rt->region_trans_release(heap);
+}
+
+/*
+ * heap_region_trans_lock_excl -- (nothing to lock)
+ */
+static void
+heap_region_trans_lock_excl(struct palloc_heap *heap)
+{
+	/* NOP */
+}
+
+/*
+ * heap_reg_trans_lock_excl_mp -- while this lock is held the region is
+ * allowed to change
+ */
+static void
+heap_reg_trans_lock_excl_mp(struct palloc_heap *heap)
+{
+	util_rwlock_wrlock(&heap->rt->rwlock);
+}
+
+
+/*
+ * heap_reg_trans_lock_shrd -- (nothing to lock)
+ */
+static void
+heap_reg_trans_lock_shrd(struct palloc_heap *heap)
+{
+	/* NOP */
+}
+
+/*
+ * heap_reg_trans_lock_shrd_mp -- while this lock is held by any thread,
+ * it is not allowed to change the active region
+ */
+static void
+heap_reg_trans_lock_shrd_mp(struct palloc_heap *heap)
+{
+	util_rwlock_rdlock(&heap->rt->rwlock);
+}
+
+/*
+ * heap_reg_trans_release -- (nothing to lock)
+ */
+static void
+heap_reg_trans_release(struct palloc_heap *heap)
+{
+	/* NOP */
+}
+
+/*
+ * heap_reg_trans_release_mp -- unlocks the region transition lock
+ */
+static void
+heap_reg_trans_release_mp(struct palloc_heap *heap)
+{
+	util_rwlock_unlock(&heap->rt->rwlock);
+}
+
+/*
+ * heap_zone_trans_lock -- (notghing to lock)
+ */
+static int
+heap_zone_trans_lock(struct palloc_heap *heap)
+{
+	return 0; /* NOP */
+}
+
+/*
+ * heap_zone_trans_lock -- (internal) locks the entire heap
+ */
+static int
+heap_zone_trans_lock_mp(struct palloc_heap *heap)
+{
+	LOG(5, "heap %p", heap);
+
+	int ret = heap->rt->mtx_lock(&heap->rt->shrd->zone_trans_lock);
+	switch (ret) {
+		case 0:
+			break;
+		case EOWNERDEAD:
+			/*
+			 * the other process might have crashed in the middle
+			 * of zone initialisation. But then the magic value
+			 * will not be set and initialsation will run again.
+			 */
+			util_mutex_consistent(&heap->rt->shrd->zone_trans_lock);
+			LOG(4, "!EOWNERDEAD shared heap lock");
+			break;
+		case EAGAIN:
+			FATAL("!EAGAIN shared heap lock");
+			break;
+		case EBUSY:
+			FATAL("!EBUSY already locked");
+			break;
+		case ETIMEDOUT:
+			ERR("!ETIMEDOUT");
+			break;
+		default:
+			ASSERT(0);
+	}
+	return ret;
+}
+
+/*
+ * heap_zone_trans_release -- (nothing to release)
+ */
+static void
+heap_zone_trans_release(struct palloc_heap *heap)
+{
+	/* NOP */
+}
+
+/*
+ * heap_zone_trans_release -- unlocks the zone transition lock
+ */
+static void
+heap_zone_trans_release_mp(struct palloc_heap *heap)
+{
+	LOG(5, "heap %p", heap);
+
+	util_mutex_unlock(&heap->rt->shrd->zone_trans_lock);
+}
+
+
+/*
+ * heap_mutex_lock -- (internal) helper function to lock
+ * the given lock and handle EOWNERDEAD and friends.
+ */
+int
+heap_mutex_lock(struct palloc_heap *h, os_mutex_t *lock)
+{
+	ASSERTne(lock, NULL);
+
+	int err = h->rt->mtx_lock(lock);
+	switch (err) {
+		case 0:
+			return 0;
+		case EOWNERDEAD:
+			/*
+			 * Another process died while holding a shared lock.
+			 * Before we continue we have to consider following
+			 * cases:
+			 *	1. We need to recover the persistent state.
+			 *	2. We need to recover the runtime state, as long
+			 *	   as the chunk belongs to our region.
+			 *
+			 * Regarding 1:
+			 * We either need to run recovery and mark
+			 * the state of the lock as consistent before we
+			 * unlock. Or we simply unlock and leave this decision
+			 * to the caller by returning ENOTRECOVERABLE.
+			 * We cant't simply mark as consistent and unlock,
+			 * because the moment another thread might lock
+			 * the run and continue on unrecovered data.
+			 * In future we might introduce a dirty bit (flag) on
+			 * the run to signal others that recovery is
+			 * still pending.
+			 *
+			 * See 'man 3p posix_mutex_consistent'
+			 * "[..] The  pthread_mutex_consistent() function is
+			 * only responsible for notifying the implementation
+			 * that the state protected by the mutex has
+			 * been recovered and that normal operations with the
+			 * mutex can be resumed. It is the responsibility of
+			 * the  application  to  recover  the state  so it can
+			 * be reused. If the application is not able to perform
+			 * the recovery, it can notify the implementation that
+			 * the situation is unrecoverable by a call to
+			 * pthread_mutex_unlock() without a prior call  to
+			 * pthread_mutex_consistent(),  in  which  case
+			 * subsequent threads that attempt to lock the mutex
+			 * will fail to acquire the lock and be
+			 * returned [ENOTRECOVERABLE]."
+			 *
+			 * Regarding 2:
+			 * If the chunk belongs to our region, its free blocks
+			 * are contained in our buckets.
+			 * The other process crashed during 'free' operation.
+			 * After recovery the free block will be set in the
+			 * persistent state and we will lazily update our
+			 * runtime state on the next run
+			 * of heap_ensure_run_bucket_filled().
+			 *
+			 * If the chunk belonged to some other process region
+			 * it won't be contained in our buckets.
+			 *
+			 * Moreover, the redo log might contain entries of two
+			 * different chunks e,g. another chunk's lock might
+			 * still be held by the crashed process.
+			 * This lock needs to released and made consistent, too.
+			 * Another process might have encountered that
+			 * crashed lock and is trying to run recovery.
+			 *
+			 * Thus, during recovery we won't be able to acquire the
+			 * lock since this results in a deadlock situation.
+			 *
+			 * We have the choice to recover without requiring the
+			 * lock, since we know that recovery is protected by the
+			 * registry lock.
+			 * Another option is to leave the relevant entries in
+			 * the recovery lock, such that the other process can
+			 * run recovery again.
+			 */
+
+			if (obj_crash_check_and_recover(h->pop) != 0) {
+				/*
+				 * Although recovery might be dissabled and
+				 * obj_crash_check_and_recover (returned
+				 * 1) we set errorcode ENOTRECOVERABLE because
+				 * the callee can not access the internal lock.
+				 */
+				LOG(7, "recovery failed");
+				util_mutex_unlock(lock);
+
+				return ENOTRECOVERABLE;
+			}
+			util_mutex_consistent(lock);
+			util_mutex_unlock(lock);
+			LOG(4, "util_mutex_consistent");
+			break;
+		case ETIMEDOUT:
+			break;
+		default:
+			FATAL("os_mutex_lock returned an unexpected error.");
+	}
+
+	return err;
 }
 
 /*
  * heap_bucket_acquire_by_id -- fetches by class a bucket exclusive for the
  *	thread until heap_bucket_release is called
+ *
+ *	returns NULL in case the default bucket was tried to acquire and a
+ *	locking error occured.
  */
 struct bucket *
 heap_bucket_acquire(struct palloc_heap *heap, struct alloc_class *c)
@@ -217,6 +613,12 @@ heap_bucket_acquire(struct palloc_heap *heap, struct alloc_class *c)
 void
 heap_bucket_release(struct palloc_heap *heap, struct bucket *b)
 {
+	ASSERTne(heap->rt->active_region, NULL);
+
+	if (heap->mp_mode && b->aclass->id == DEFAULT_ALLOC_CLASS_ID) {
+		heap_region_release(heap, heap->rt->active_region);
+	}
+
 	util_mutex_unlock(&b->lock);
 }
 
@@ -226,7 +628,11 @@ heap_bucket_release(struct palloc_heap *heap, struct bucket *b)
 os_mutex_t *
 heap_get_run_lock(struct palloc_heap *heap, uint32_t chunk_id)
 {
-	return &heap->rt->run_locks[chunk_id % MAX_RUN_LOCKS];
+	/*
+	 * XXX mp-mode -- needs proper lock distribution
+	 * Several zones might be active at the same time.
+	 */
+	return &heap->rt->shrd->run_locks[chunk_id % MAX_RUN_LOCKS];
 }
 
 /*
@@ -249,7 +655,7 @@ heap_max_zone(size_t size)
 /*
  * get_zone_size_idx -- (internal) calculates zone size index
  */
-static uint32_t
+static uint16_t
 get_zone_size_idx(uint32_t zone_id, unsigned max_zone, size_t heap_size)
 {
 	ASSERT(max_zone > 0);
@@ -260,14 +666,17 @@ get_zone_size_idx(uint32_t zone_id, unsigned max_zone, size_t heap_size)
 	size_t zone_raw_size = heap_size - zone_id * ZONE_MAX_SIZE;
 
 	ASSERT(zone_raw_size >= (sizeof(struct zone_header) +
+			sizeof(struct zone_region) * MAX_REGIONS +
 			sizeof(struct chunk_header) * MAX_CHUNK));
 	zone_raw_size -= sizeof(struct zone_header) +
+		sizeof(struct zone_region) * MAX_REGIONS +
 		sizeof(struct chunk_header) * MAX_CHUNK;
 
 	size_t zone_size_idx = zone_raw_size / CHUNKSIZE;
-	ASSERT(zone_size_idx <= UINT32_MAX);
+	ASSERT(zone_size_idx <= UINT16_MAX);
 
-	return (uint32_t)zone_size_idx;
+	/* upper limit ==  MAX_CHUNK */
+	return (uint16_t)zone_size_idx;
 }
 
 /*
@@ -285,7 +694,7 @@ heap_chunk_write_footer(struct chunk_header *hdr, uint32_t size_idx)
 	f.type = CHUNK_TYPE_FOOTER;
 	f.size_idx = size_idx;
 	*(hdr + size_idx - 1) = f;
-	/* no need to persist, footers are recreated in heap_populate_buckets */
+	/* no need to persist, footers are recreated in heap_populate_bucket */
 	VALGRIND_SET_CLEAN(hdr + size_idx - 1, sizeof(f));
 }
 
@@ -310,20 +719,88 @@ heap_chunk_init(struct palloc_heap *heap, struct chunk_header *hdr,
 }
 
 /*
- * heap_zone_init -- (internal) writes zone's first chunk and header
+ * heap_write_region -- (internal) writes a zone_region
  */
 static void
-heap_zone_init(struct palloc_heap *heap, uint32_t zone_id)
+heap_write_region(const struct palloc_heap *heap, struct zone_region *r,
+    uint16_t size, uint16_t offset,  unsigned idx) {
+
+	struct zone_region nrgn = {
+		.idx = idx,
+		.offset = offset,
+		.size = size,
+		.claimant = REGION_UNCLAIMED,
+	};
+	/*
+	 * Although struct region_zone exceeds the 8 byte limit,
+	 * it is safe to persist without a redo log, because the
+	 * region will be reinitialized as long the zone magic value
+	 * is not set.
+	 */
+
+	*r = nrgn;
+	pmemops_persist(&heap->p_ops, r, sizeof(*r));
+}
+
+/*
+ * heap_zone_init -- (internal) writes zone's header and the first chunk of
+ * each region
+ */
+static void
+heap_zone_init(struct palloc_heap *heap, uint32_t zone_id, uint16_t num_regions)
 {
+	LOG(3, "heap %p zone_id %d num_regions %d", heap, zone_id, num_regions);
+
+	ASSERT(num_regions <= MAX_REGIONS);
+
+	uint16_t r_size;
+	uint16_t r_size_last;
+	uint16_t r_size_current;
+	struct zone_region *r;
+
 	struct zone *z = ZID_TO_ZONE(heap->layout, zone_id);
-	uint32_t size_idx = get_zone_size_idx(zone_id, heap->rt->max_zone,
-			heap->size);
+	uint16_t z_size_idx = get_zone_size_idx(zone_id, heap->rt->max_zone,
+	    heap->size);
+	ASSERT(z_size_idx > 0);
 
-	heap_chunk_init(heap, &z->chunk_headers[0], CHUNK_TYPE_FREE, size_idx);
+	/*
+	 * If we do not have at least one chunk per region, we init that zone
+	 * with a single region.
+	 * Othewise we devide the zone in equally sized segments, with the
+	 * exception that the last region additionaly contains the
+	 * remainder.
+	 */
+	if (z_size_idx <= num_regions) {
+		/* for last zone only */
+		num_regions = 1;
+		r_size = z_size_idx;
+		r_size_last = r_size;
+	} else {
+		r_size = (uint16_t)((z_size_idx / num_regions));
+		r_size_last = (uint16_t)(r_size + (z_size_idx % (r_size *
+		    num_regions)));
+	}
 
+	for (unsigned i = 0; i < num_regions; ++i) {
+		/* init first chunk of each region */
+		int is_last = (i == (uint16_t)(num_regions - 1));
+		r_size_current = is_last ? r_size_last : r_size;
+
+		r = &z->regions[i];
+		heap_write_region(heap, r, r_size_current,
+		    (uint16_t)(r_size * i), i);
+
+		/* regions are only locked and cleaned up in mp-mode */
+		if (heap->mp_mode)
+			util_mutex_init_mp(&r->lock);
+
+		heap_chunk_init(heap, &z->chunk_headers[r->offset],
+		    CHUNK_TYPE_FREE, r_size_current);
+	}
 	struct zone_header nhdr = {
-		.size_idx = size_idx,
+		.size_idx = z_size_idx,
 		.magic = ZONE_HEADER_MAGIC,
+		.regions_in_use = num_regions,
 	};
 	z->header = nhdr;  /* write the entire header (8 bytes) at once */
 	pmemops_persist(&heap->p_ops, &z->header, sizeof(z->header));
@@ -338,7 +815,7 @@ heap_run_init(struct palloc_heap *heap, struct bucket *b,
 {
 	struct alloc_class *c = b->aclass;
 	ASSERTeq(c->type, CLASS_RUN);
-
+	ASSERT(heap_memblock_from_act_region(m));
 	struct zone *z = ZID_TO_ZONE(heap->layout, m->zone_id);
 
 	struct chunk_run *run = (struct chunk_run *)&z->chunks[m->chunk_id];
@@ -422,6 +899,7 @@ heap_run_insert(struct palloc_heap *heap, struct bucket *b,
 		nm.size_idx = size_idx;
 
 	do {
+		ASSERT(heap_memblock_from_act_region(&nm));
 		bucket_insert_block(b, &nm);
 		ASSERT(nm.size_idx <= UINT16_MAX);
 		ASSERT(nm.block_off + nm.size_idx <= UINT16_MAX);
@@ -524,21 +1002,28 @@ heap_reuse_run(struct palloc_heap *heap, struct bucket *b,
 /*
  * heap_reclaim_run -- checks the run for available memory if unclaimed.
  *
- * Returns 1 if reclaimed chunk, 0 otherwise.
+ * Returns  number of reclaimed chunks.
  */
 static int
 heap_reclaim_run(struct palloc_heap *heap, struct bucket *defb,
-	struct chunk_run *run, struct memory_block *m)
+	struct chunk_run *run, struct memory_block *m,
+	struct zone_region *reg)
 {
+	LOG(4, "heap %p bucket %p, memory block %p reg %" PRIu32,
+		heap, defb, m, reg->idx);
+	ASSERT(heap->mp_mode == 0 || HEAP_CHUNK_FROM_REGION(reg, m->chunk_id));
+
 	if (m->m_ops->claim(m) != 0)
 		return 0; /* this run already has an owner */
 
+	int chunks = 0;
 	struct alloc_class_run_proto run_proto;
 	alloc_class_generate_run_proto(&run_proto,
 		run->block_size, m->size_idx);
 
 	os_mutex_t *lock = m->m_ops->get_lock(m);
-	util_mutex_lock(lock);
+	if ((errno = heap_mutex_lock(heap, lock)) != 0)
+		return -1;
 
 	unsigned i;
 	unsigned nval = run_proto.bitmap_nval;
@@ -570,28 +1055,33 @@ heap_reclaim_run(struct palloc_heap *heap, struct bucket *defb,
 		heap_chunk_init(heap, hdr, CHUNK_TYPE_FREE, nb.size_idx);
 		memblock_rebuild_state(heap, &nb);
 
-		nb = heap_coalesce_huge(heap, defb, &nb);
+		nb = heap_coalesce_huge(heap, defb, &nb, reg);
 		nb.m_ops->prep_hdr(&nb, MEMBLOCK_FREE, &ctx);
 
 		operation_process(&ctx);
 
+		ASSERT(heap->mp_mode == 0 ||
+		    HEAP_CHUNK_FROM_REGION(reg, nb.chunk_id));
 		bucket_insert_block(defb, &nb);
 
 		*m = nb;
+		chunks = (int)nb.size_idx;
 	} else {
 		struct alloc_class *c = alloc_class_by_unit_size(
 			heap->rt->alloc_classes,
 			run->block_size);
-		if (c != NULL && c->type == CLASS_RUN &&
-				c->run.size_idx == m->size_idx &&
-				c->header_type == m->header_type) {
-			recycler_put(heap->rt->recyclers[c->id], m);
-		}
+
+		if (c == NULL ||
+		    c->type != CLASS_RUN ||
+		    c->run.size_idx != m->size_idx ||
+		    c->header_type != m->header_type ||
+			recycler_put(heap->rt->recyclers[c->id], m) < 0)
+			m->m_ops->claim_revoke(m);
 	}
 
 	util_mutex_unlock(lock);
 
-	return empty;
+	return chunks;
 }
 
 /*
@@ -601,36 +1091,81 @@ static void
 heap_init_free_chunk(struct palloc_heap *heap,
 	struct bucket *bucket,
 	struct chunk_header *hdr,
-	struct memory_block *m)
+	struct memory_block *m,
+	struct zone_region *r)
 {
 	struct operation_context ctx;
 	operation_init(&ctx, heap->base, NULL, NULL);
 	ctx.p_ops = &heap->p_ops;
 	heap_chunk_write_footer(hdr, hdr->size_idx);
+	ASSERT(heap->mp_mode == 0 || HEAP_CHUNK_FROM_REGION(r, m->chunk_id));
+
 	/*
 	 * Perform coalescing just in case there
 	 * are any neighbouring free chunks.
 	 */
-	struct memory_block nm = heap_coalesce_huge(heap, bucket, m);
+	struct memory_block nm = heap_coalesce_huge(heap, bucket, m, r);
 	if (nm.chunk_id != m->chunk_id) {
 		m->m_ops->prep_hdr(&nm, MEMBLOCK_FREE, &ctx);
 		operation_process(&ctx);
 	}
 	*m = nm;
+	ASSERT(heap->mp_mode == 0 || HEAP_CHUNK_FROM_REGION(r, m->chunk_id));
 	bucket_insert_block(bucket, m);
 }
 
 /*
- * heap_reclaim_zone_garbage -- (internal) creates volatile state of unused runs
+ * heap_empty_bucket -- (internal) empty / clear a  buckets content
+ */
+static void
+heap_empty_bucket(struct bucket *b)
+{
+	LOG(4, "bucket %p", b);
+
+	b->c_ops->rm_all(b->container);
+
+	/* get rid of the active block in the bucket */
+	if (b->is_active) {
+		b->is_active = 0;
+		b->active_memory_block.m_ops
+			->claim_revoke(&b->active_memory_block);
+	}
+}
+
+/*
+ * heap_mutex_timedlock -- (internal) wraps os_mutex_timedlock to pass in
+ * the default timeout
  */
 static int
-heap_reclaim_zone_garbage(struct palloc_heap *heap, struct bucket *bucket,
-	uint32_t zone_id, int init)
+heap_mutex_timedlock(os_mutex_t *mutex)
 {
+	LOG(5, "mutex %p", mutex);
+	struct timespec ts;
+
+	return os_mutex_timedlock(mutex, mp_set_mtx_timeout(&ts));
+}
+
+/*
+ * heap_reclaim_region_garbage -- (internal) creates volatile state of
+ * unused runs
+ */
+static int
+heap_reclaim_region_garbage(struct palloc_heap *heap, struct bucket *b,
+	uint32_t zone_id, int init, struct zone_region *r, uint32_t units)
+{
+	LOG(4, "heap %p bucket %p zone_id %" PRIu32 " region %" PRIu32
+		" units %" PRIu32 " init %d ",
+		heap, b, zone_id, r->idx, units, init);
+
 	struct zone *z = ZID_TO_ZONE(heap->layout, zone_id);
 
 	struct chunk_run *run = NULL;
+	int ret = 0;
 	int rchunks = 0;
+	int max_chunks = 0;
+
+	uint32_t region_end = HEAP_END_OF_REGION(r);
+	ASSERT(region_end <= z->header.size_idx);
 
 	/*
 	 * If this is the first time this zone is processed, recreate all
@@ -638,7 +1173,7 @@ heap_reclaim_zone_garbage(struct palloc_heap *heap, struct bucket *bucket,
 	 * heap_init_free_chunk call expects the footers to be created.
 	 */
 	if (init) {
-		for (uint32_t i = 0; i < z->header.size_idx; ) {
+		for (uint32_t i = r->offset; i <= region_end; ) {
 			struct chunk_header *hdr = &z->chunk_headers[i];
 			switch (hdr->type) {
 				case CHUNK_TYPE_FREE:
@@ -652,7 +1187,7 @@ heap_reclaim_zone_garbage(struct palloc_heap *heap, struct bucket *bucket,
 		}
 	}
 
-	for (uint32_t i = 0; i < z->header.size_idx; ) {
+	for (uint32_t i = r->offset; i <= region_end; ) {
 		struct chunk_header *hdr = &z->chunk_headers[i];
 		ASSERT(hdr->size_idx != 0);
 
@@ -666,14 +1201,20 @@ heap_reclaim_zone_garbage(struct palloc_heap *heap, struct bucket *bucket,
 		switch (hdr->type) {
 			case CHUNK_TYPE_RUN:
 				run = (struct chunk_run *)&z->chunks[i];
-				rchunks += heap_reclaim_run(heap, bucket,
-					run, &m);
+				if ((ret = heap_reclaim_run(heap, b, run, &m,
+					r)) == -1)
+					return ret;
+
+				rchunks += ret;
+				max_chunks = MAX(max_chunks, ret);
 				break;
 			case CHUNK_TYPE_FREE:
 				if (init) {
-					rchunks += (int)m.size_idx;
-					heap_init_free_chunk(heap, bucket,
-						hdr, &m);
+					heap_init_free_chunk(heap, b,
+						hdr, &m, r);
+					ret = (int)m.size_idx;
+					rchunks += ret;
+					max_chunks = MAX(max_chunks, ret);
 				}
 				break;
 			case CHUNK_TYPE_USED:
@@ -685,39 +1226,365 @@ heap_reclaim_zone_garbage(struct palloc_heap *heap, struct bucket *bucket,
 		i = m.chunk_id + m.size_idx; /* hdr might have changed */
 	}
 
-	return rchunks == 0 ? ENOMEM : 0;
+	if (units > 0) {
+		/* the caller requested at least 'units' of chunks. */
+		return max_chunks < (int)units  ? ENOMEM : 0;
+	} else {
+		return rchunks == 0 ? ENOMEM : 0;
+	}
+}
+
+/*
+ * heap_clear_volatile_state() -- (internal) clears the volatile state of the
+ * heap by removing all blocks from all buckets
+ */
+static void
+heap_clear_volatile_state(struct palloc_heap *heap)
+{
+	LOG(4, NULL);
+
+	struct bucket *b;
+	struct alloc_class *c;
+	struct memory_block m = MEMORY_BLOCK_NONE;
+	for (uint8_t i = 0; i < MAX_ALLOCATION_CLASSES; ++i) {
+		/* remove memory blocks from recycler */
+		while (recycler_get(heap->rt->recyclers[i], &m) == 0) {
+			m.m_ops->claim_revoke(&m);
+			m.size_idx = 0;
+		}
+
+		/*
+		 * huge memory blocks are always allocated from a
+		 * single bucket
+		 */
+		if ((c = alloc_class_by_id(heap->rt->alloc_classes, i)) ==
+		    NULL || c->id == DEFAULT_ALLOC_CLASS_ID)
+			continue;
+
+		for (unsigned j = 0; j < heap->rt->narenas; j++) {
+			b = heap->rt->arenas[j].buckets[c->id];
+			LOG(4, "clearing arena %u, class_id %"PRIu8,
+				j, b->aclass->id);
+			/*
+			 * We don't respect existing bucket locks, because
+			 * this operation is synchronized by the default
+			 * bucket.
+			 */
+			if (b->is_active) {
+				b->c_ops->rm_all(b->container);
+				b->is_active = 0;
+			}
+		}
+	}
+
+	/*
+	 * Since all arenas use the same default bucket, we need to empty it
+	 * only once
+	 */
+	heap_empty_bucket(heap->rt->default_bucket);
+}
+
+/*
+ * heap_region_reset_claimant -- resets the field claimant to initial value
+ */
+static void
+heap_region_reset_claimant(struct zone_region *r)
+{
+	__sync_fetch_and_or(&r->claimant, REGION_UNCLAIMED);
+
+	/* no need to persist, (re-)initialized in heap_boot */
+	VALGRIND_SET_CLEAN(&r->claimant, sizeof(r->claimant));
+}
+
+/*
+ * heap_region_claim -- (internal) claim the given region, if available
+ */
+static int
+heap_region_claim(struct palloc_heap *h, uint32_t r_id, uint32_t zone_id)
+{
+	struct zone *z = ZID_TO_ZONE(h->layout, zone_id);
+	struct zone_region *r_new = &z->regions[r_id];
+	struct zone_region *r_old = h->rt->active_region;
+
+	if (r_new->claimant != REGION_UNCLAIMED ||
+	    !util_bool_compare_and_swap32(&r_new->claimant, REGION_UNCLAIMED,
+		    h->proc_idx)) {
+			return -1;
+	}
+
+	/* we found an unclaimed region */
+	h->rt->active_region = r_new;
+
+	/* no need to persist, (re-)initialized in heap_boot */
+	VALGRIND_SET_CLEAN(&r_new->claimant, sizeof(r_new->claimant));
+
+	LOG(4, "transition: zone_id %"	PRIu32 " -> %"PRIu32 ", region %"PRIu32
+		" -> %"PRIu32, h->rt->active_zone_id, zone_id,
+		r_old ? r_old->idx : 0, r_new->idx);
+
+	/* unclaim old region */
+	if (r_old != NULL) {
+		heap_region_reset_claimant(r_old);
+	}
+	/* no need to persist, (re-)initialized in heap_boot */
+
+	return 0;
+}
+
+/*
+ * heap_region_acquire -- updates volatile state
+ */
+static int
+heap_region_acquire(struct palloc_heap *h, struct bucket *b, uint32_t r_id,
+	uint32_t zone_id, int init, uint32_t units)
+{
+	LOG(4, "heap %p bucket %p r_id %" PRIu32
+		" zone_id %" PRIu32 " init %d units %" PRIu32,
+		h, b, r_id, zone_id, init, units);
+
+	struct zone_region *r_old = h->rt->active_region;
+
+	if (heap_region_claim(h, r_id, zone_id) != 0)
+		goto out;
+
+	/*
+	 * swap locked regions.
+	 */
+	if (h->mp_mode) {
+		heap_region_release(h, r_old);
+
+		int err;
+		if ((err = heap_region_lock(h, h->rt->active_region))) {
+			LOG(4, "heap_region_lock error %d", err);
+			return err;
+		}
+	}
+
+	/* process region */
+	if (heap_reclaim_region_garbage(h, b, zone_id, init,
+		h->rt->active_region, units) == 0) {
+		return 0;
+	}
+out:
+	return ENOMEM;
+}
+
+static int
+heap_zone_reclaim_regions(struct palloc_heap *heap, struct bucket *b,
+    unsigned start_idx, uint32_t zone_id, int init, uint32_t units)
+{
+	LOG(3, "heap %p bucket %p start_idx %d zone_id %d init %d units %d",
+	    heap, b, start_idx, zone_id, init, units);
+
+	ASSERTne(heap->rt->active_region, NULL);
+
+	unsigned processed_regions = 0;
+	uint32_t regions_in_use = ZID_TO_ZONE(heap->layout,
+		zone_id)->header.regions_in_use;
+
+	/*
+	 * iterate the entire zone
+	 * starts from beginning (wraps around) when zone end is reached
+	 */
+	for (unsigned i = start_idx;
+	    ++(processed_regions) < regions_in_use;
+	    i = (i + 1) % regions_in_use) {
+
+		/* skip current */
+		if (unlikely(zone_id == heap->rt->active_zone_id &&
+			    heap->rt->active_region->idx == i))
+			continue;
+
+		heap_clear_volatile_state(heap);
+
+		if (heap_region_acquire(heap, b, i, zone_id, init, units) == 0)
+			return 0;
+	}
+
+	return -1;
+}
+
+static int
+heap_zone_assign(struct palloc_heap *heap, uint32_t *assigned_zone_id,
+    int new_zone)
+{
+	LOG(3, "heap %p new_zone %d", heap, new_zone);
+
+	struct heap_rt *h = heap->rt;
+
+	int ret = 0;
+	uint32_t zone_id;
+	volatile unsigned *zones_exhausted_ptr = &h->shrd->zones_exhausted;
+
+	if ((errno = heap->rt->zone_trans_hold(heap)) != 0) {
+		if (errno == EOWNERDEAD)
+			h->zone_trans_release(heap);
+
+		FATAL("heap_zone_trans_lock");
+	}
+
+	if (new_zone) {
+		if (*zones_exhausted_ptr == h->max_zone) {
+			LOG(4, "!all zones exhausted");
+			ret = ENOMEM;
+
+			goto out;
+		}
+		zone_id = (*zones_exhausted_ptr)++;
+	} else {
+		/* get last used zone */
+		zone_id = *zones_exhausted_ptr;
+	}
+
+	struct zone *z = ZID_TO_ZONE(heap->layout, zone_id);
+
+	/* ignore zone and chunk headers */
+	VALGRIND_ADD_TO_GLOBAL_TX_IGNORE(z, sizeof(z->header) +
+					    sizeof(z->regions) +
+					    sizeof(z->chunk_headers));
+
+	if (z->header.magic != ZONE_HEADER_MAGIC)
+		heap_zone_init(heap, zone_id, MAX_REGIONS);
+
+	*assigned_zone_id = zone_id;
+
+out:
+	h->zone_trans_release(heap);
+
+	return ret;
 }
 
 /*
  * heap_populate_bucket -- (internal) creates volatile state of memory blocks
  */
 static int
-heap_populate_bucket(struct palloc_heap *heap, struct bucket *bucket)
+heap_populate_bucket_mp(struct palloc_heap *heap, struct bucket *bucket,
+    uint32_t units)
 {
+	LOG(3, "heap %p bucket %p units %d", heap, bucket, units);
+
+	uint32_t zone_start_id;
+	int ret = 0;
 	struct heap_rt *h = heap->rt;
+	struct heap_rt_shm *shrd = h->shrd;
 
-	if (h->zones_exhausted == h->max_zone)
-		return ENOMEM;
+	uint32_t zone_id;
 
-	uint32_t zone_id = h->zones_exhausted++;
-	struct zone *z = ZID_TO_ZONE(heap->layout, zone_id);
+	ASSERTne(h->active_region, NULL);
 
-	/* ignore zone and chunk headers */
-	VALGRIND_ADD_TO_GLOBAL_TX_IGNORE(z, sizeof(z->header) +
-		sizeof(z->chunk_headers));
+	/* upgrade lock */
+	h->region_trans_release(heap);
+	h->region_trans_lock_excl(heap);
 
-	if (z->header.magic != ZONE_HEADER_MAGIC)
-		heap_zone_init(heap, zone_id);
+	uint32_t region_start_id = h->active_region->idx + 1;
 
-	return heap_reclaim_zone_garbage(heap, bucket, zone_id, 1 /* init */);
+	/* process current zone */
+	if (heap_zone_reclaim_regions(heap, bucket, region_start_id,
+		h->active_zone_id, 1 /* init */, units) == 0)
+		goto out;
+
+	/*
+	 * Travere all other zones (that are already in use).
+	 *
+	 * This is expensive, but we want to keep fragmentation low.
+	 *
+	 * Maybe we should leave this decision to the user via a env-var or
+	 * ctrl.
+	 */
+	zone_start_id = h->active_zone_id;
+
+	zone_id = 0; /* start from scratch */
+	do {
+		if (zone_id == zone_start_id)
+			continue;
+
+		if (heap_zone_reclaim_regions(heap, bucket, 0, zone_id,
+			1 /* init */, units) == 0)
+			goto out_zone;
+
+	} while (++zone_id < shrd->zones_exhausted);
+
+	/*
+	 * We have no other choice than to assign a new zone.
+	 * We could run recovery to cleanup any leftovers, that we could use.
+	 * But we delegate that decission to the caller.
+	 */
+	while (heap_zone_assign(heap, &zone_id, 1 /* new zone */) == 0) {
+		if (heap_zone_reclaim_regions(heap, bucket, 0, zone_id,
+			1 /* init */, 0) == 0)
+			goto out_zone;
+	}
+
+	/* downgrade lock */
+	h->region_trans_release(heap);
+	h->region_trans_lock_shrd(heap);
+
+	return ENOMEM;
+
+out_zone:
+	h->active_zone_id = zone_id;
+out:
+	/*
+	 * downgrade such that others can proceed
+	 * and update their volatile state
+	 */
+	/* downgrade lock */
+	h->region_trans_release(heap);
+	h->region_trans_lock_shrd(heap);
+
+	return ret;
+}
+
+/*
+ * heap_populate_bucket -- (internal) creates volatile state of memory blocks
+ */
+static int
+heap_populate_bucket(struct palloc_heap *heap, struct bucket *bucket,
+	uint32_t units)
+{
+	LOG(4, "heap %p bucket %p", heap, bucket);
+
+	/* only used in multi-process mode */
+	(void) units;
+
+	ASSERTne(heap->rt->active_region, NULL);
+	uint32_t zone_id = heap->rt->active_zone_id;
+
+	unsigned next_region_idx = heap->rt->active_region->idx + 1;
+
+	do {
+		uint32_t regions_in_use = ZID_TO_ZONE(heap->layout,
+			zone_id)->header.regions_in_use;
+
+		for (unsigned r_id = next_region_idx;
+			r_id < regions_in_use;
+			++r_id) {
+
+			if (heap_region_acquire(heap, bucket, r_id,
+				zone_id, 1 /* init */, 0) == 0) {
+				heap->rt->active_zone_id = zone_id;
+				return 0;
+			}
+		}
+
+		next_region_idx = 0;
+	} while (heap_zone_assign(heap, &zone_id, 1 /* new zone */) == 0);
+
+	return ENOMEM;
 }
 
 /*
  * heap_reclaim_garbage -- (internal) creates volatile state of unused runs
  */
 static int
-heap_reclaim_garbage(struct palloc_heap *heap, struct bucket *bucket)
+heap_reclaim_garbage(struct palloc_heap *heap, struct bucket *bucket,
+	uint32_t units)
 {
+	LOG(4, "heap %p bucket %p", heap, bucket);
+	ASSERTne(heap->rt->active_region, NULL);
+
+	(void) units; /* only used in mp-mode */
+
 	struct memory_block m;
 	for (size_t i = 0; i < MAX_ALLOCATION_CLASSES; ++i) {
 		while (recycler_get(heap->rt->recyclers[i], &m) == 0) {
@@ -726,25 +1593,143 @@ heap_reclaim_garbage(struct palloc_heap *heap, struct bucket *bucket)
 	}
 
 	int ret = ENOMEM;
-	for (unsigned i = 0; i < heap->rt->zones_exhausted; ++i) {
-		if (heap_reclaim_zone_garbage(heap,
-			bucket, i, 0 /* not init */) == 0)
-			ret = 0;
+	for (unsigned i = 0;
+		i == 0|| i < heap->rt->shrd->zones_exhausted; ++i) {
+		struct zone *z = ZID_TO_ZONE(heap->layout, i);
+		uint16_t r_max = z->header.regions_in_use;
+		for (unsigned r_id = 0; r_id < r_max; ++r_id) {
+			struct zone_region *r = &z->regions[r_id];
+			if (heap_reclaim_region_garbage(heap, bucket,
+			    i, 0 /* not init */, r, 0) == 0) {
+				ret = 0;
+			}
+		}
 	}
 
 	return ret;
 }
 
 /*
- * heap_ensure_huge_bucket_filled --
- *	(internal) refills the default bucket if needed
+ * heap_reclaim_garbage_mp -- (internal) creates volatile state of unused runs
+ * multi-process variant of heap_reclaim_garbage()
  */
 static int
-heap_ensure_huge_bucket_filled(struct palloc_heap *heap, struct bucket *bucket)
+heap_reclaim_garbage_mp(struct palloc_heap *heap, struct bucket *bucket,
+	uint32_t units)
 {
-	return (heap_reclaim_garbage(heap, bucket) == 0 ||
-		heap_populate_bucket(heap, bucket) == 0) ? 0 : ENOMEM;
+	LOG(3, "heap %p bucket %p", heap, bucket);
+
+	ASSERTne(heap->rt->active_region, NULL);
+
+	struct memory_block m = MEMORY_BLOCK_NONE;
+	for (size_t i = 0; i < MAX_ALLOCATION_CLASSES; ++i) {
+		while (recycler_get(heap->rt->recyclers[i], &m) == 0) {
+			m.m_ops->claim_revoke(&m);
+		}
+	}
+
+	/*
+	 * To avoid duplicate entries we clear the bucket.
+	 * We do this since another process might have tainted our region and
+	 * our transient state needs to be rebuild.
+	 *
+	 * Huge buckets are normaly returned to the transient state in
+	 * palloc_operation. But in case another process frees a chunk from
+	 * our region it wouldn't be put back to the bucket without
+	 * reinitialisation in heap_init_free_chunk().
+	 */
+	heap_empty_bucket(bucket);
+
+	return heap_reclaim_region_garbage(heap, bucket,
+	    heap->rt->active_zone_id, 1 /* init */, heap->rt->active_region,
+	    units);
 }
+
+/*
+ * heap_resize_chunk -- (internal) splits the chunk into two smaller ones
+ */
+static void
+heap_resize_chunk(struct palloc_heap *heap, struct bucket *bucket,
+	uint32_t chunk_id, uint32_t zone_id, uint32_t new_size_idx)
+{
+	ASSERT(heap->mp_mode == 0 ||
+	    HEAP_CHUNK_FROM_REGION(heap->rt->active_region, chunk_id));
+
+	uint32_t new_chunk_id = chunk_id + new_size_idx;
+
+	struct zone *z = ZID_TO_ZONE(heap->layout, zone_id);
+	struct chunk_header *old_hdr = &z->chunk_headers[chunk_id];
+	struct chunk_header *new_hdr = &z->chunk_headers[new_chunk_id];
+
+	uint32_t rem_size_idx = old_hdr->size_idx - new_size_idx;
+	heap_chunk_init(heap, new_hdr, CHUNK_TYPE_FREE, rem_size_idx);
+	heap_chunk_init(heap, old_hdr, CHUNK_TYPE_FREE, new_size_idx);
+
+	struct memory_block m = {new_chunk_id, zone_id, rem_size_idx, 0,
+	    0, 0, NULL, NULL};
+	memblock_rebuild_state(heap, &m);
+	ASSERT(heap->mp_mode == 0 ||
+	    HEAP_CHUNK_FROM_REGION(heap->rt->active_region, new_chunk_id));
+
+	bucket_insert_block(bucket, &m);
+}
+
+
+/*
+ * heap_recycle_block -- (internal) recycles unused part of the memory block
+ */
+static void
+heap_recycle_block(struct palloc_heap *heap, struct bucket *b,
+	struct memory_block *m, uint32_t units)
+{
+	if (b->aclass->type == CLASS_RUN) {
+		ASSERT(units <= UINT16_MAX);
+		ASSERT(m->block_off + units <= UINT16_MAX);
+		struct memory_block r = { m->chunk_id, m->zone_id,
+		    m->size_idx - units, (uint16_t)(m->block_off + units), 0,
+		    0, NULL, NULL};
+		memblock_rebuild_state(heap, &r);
+		if ((heap->mp_mode == 0 ||
+		    HEAP_CHUNK_FROM_REGION(heap->rt->active_region,
+		    r.chunk_id)) == 0)
+			return;
+
+		bucket_insert_block(b, &r);
+	} else {
+		heap_resize_chunk(heap, b, m->chunk_id, m->zone_id, units);
+	}
+
+	m->size_idx = units;
+}
+
+/*
+ * heap_free_chunk_reuse -- reuses existing free chunk
+ */
+void
+heap_free_chunk_reuse(struct palloc_heap *heap,
+	struct bucket *bucket,
+	struct memory_block *m)
+{
+	struct operation_context ctx;
+	operation_init(&ctx, heap->base, NULL, NULL);
+	ctx.p_ops = &heap->p_ops;
+
+	/*
+	 * Perform coalescing just in case there
+	 * are any neighbouring free chunks.
+	 */
+	struct memory_block nm = heap_coalesce_huge(heap, bucket, m,
+	    heap_get_active_region(heap));
+	if (nm.size_idx != m->size_idx) {
+		m->m_ops->prep_hdr(&nm, MEMBLOCK_FREE, &ctx);
+		operation_process(&ctx);
+	}
+
+	*m = nm;
+
+	bucket_insert_block(bucket, m);
+}
+
 
 /*
  * heap_ensure_run_bucket_filled -- (internal) refills the bucket if needed
@@ -753,8 +1738,13 @@ static int
 heap_ensure_run_bucket_filled(struct palloc_heap *heap, struct bucket *b,
 	uint32_t units)
 {
+	LOG(4, "heap %p bucket %p units %i", heap, b, units);
+
 	ASSERTeq(b->aclass->type, CLASS_RUN);
 
+	int ret = 0;
+
+	/* get rid of the active block in the bucket */
 	if (b->is_active) {
 		b->c_ops->rm_all(b->container);
 		b->active_memory_block.m_ops
@@ -767,11 +1757,7 @@ heap_ensure_run_bucket_filled(struct palloc_heap *heap, struct bucket *b,
 	struct memory_block m = MEMORY_BLOCK_NONE;
 
 	if (recycler_get(h->recyclers[b->aclass->id], &m) == 0) {
-		os_mutex_t *lock = m.m_ops->get_lock(&m);
-
-		util_mutex_lock(lock);
 		heap_reuse_run(heap, b, &m);
-		util_mutex_unlock(lock);
 
 		b->active_memory_block = m;
 		b->is_active = 1;
@@ -781,21 +1767,49 @@ heap_ensure_run_bucket_filled(struct palloc_heap *heap, struct bucket *b,
 
 	m.size_idx = b->aclass->run.size_idx;
 
+	/*
+	 * unlock the rwlock, such that one thread can obtain the write lock.
+	 * default bucket lock protects/syncs next steps.
+	 *
+	 * If we don't drop the transistion lock here, we will run into a
+	 * deadlock, since the default bucket can only be hold from a single
+	 * thread at a time. When the waiting process obtains the lock, a
+	 * region tranistion might have happened in the meantime.
+	 */
+	heap->rt->region_trans_release(heap);
+
 	/* cannot reuse an existing run, create a new one */
 	struct bucket *defb = heap_bucket_acquire_by_id(heap,
 			DEFAULT_ALLOC_CLASS_ID);
-	if (heap_get_bestfit_block(heap, defb, &m) == 0) {
+
+	/*
+	 * In case we obtained the default bucket, it is safe to share the
+	 * region, again.
+	 */
+	h->region_trans_lock_shrd(heap);
+
+	if (defb == NULL)
+		return errno;
+
+	if ((ret = heap_get_bestfit_block(heap, defb, &m)) == 0) {
 		ASSERTeq(m.block_off, 0);
+
+		ASSERT(heap_memblock_from_act_region(&m));
 
 		heap_create_run(heap, b, &m);
 
 		b->active_memory_block = m;
 		b->is_active = 1;
 
-		heap_bucket_release(heap, defb);
-		return 0;
+		goto out;
 	}
+
+	if (ret != ENOMEM)
+		goto err;
+
 	heap_bucket_release(heap, defb);
+
+	ASSERTne(heap->rt->active_region, NULL);
 
 	/*
 	 * Try the recycler again, the previous call to the bestfit_block for
@@ -803,7 +1817,9 @@ heap_ensure_run_bucket_filled(struct palloc_heap *heap, struct bucket *b,
 	 */
 	if (recycler_get(h->recyclers[b->aclass->id], &m) == 0) {
 		os_mutex_t *lock = m.m_ops->get_lock(&m);
-		util_mutex_lock(lock);
+		if ((ret = heap_mutex_lock(heap, lock)) != 0)
+			return ret;
+
 		heap_reuse_run(heap, b, &m);
 		util_mutex_unlock(lock);
 
@@ -830,51 +1846,12 @@ heap_ensure_run_bucket_filled(struct palloc_heap *heap, struct bucket *b,
 	}
 
 	return ENOMEM;
-}
 
-/*
- * heap_resize_chunk -- (internal) splits the chunk into two smaller ones
- */
-static void
-heap_resize_chunk(struct palloc_heap *heap, struct bucket *bucket,
-	uint32_t chunk_id, uint32_t zone_id, uint32_t new_size_idx)
-{
-	uint32_t new_chunk_id = chunk_id + new_size_idx;
+err:
+out:
+	heap_bucket_release(heap, defb);
 
-	struct zone *z = ZID_TO_ZONE(heap->layout, zone_id);
-	struct chunk_header *old_hdr = &z->chunk_headers[chunk_id];
-	struct chunk_header *new_hdr = &z->chunk_headers[new_chunk_id];
-
-	uint32_t rem_size_idx = old_hdr->size_idx - new_size_idx;
-	heap_chunk_init(heap, new_hdr, CHUNK_TYPE_FREE, rem_size_idx);
-	heap_chunk_init(heap, old_hdr, CHUNK_TYPE_FREE, new_size_idx);
-
-	struct memory_block m = {new_chunk_id, zone_id, rem_size_idx, 0,
-		0, 0, NULL, NULL};
-	memblock_rebuild_state(heap, &m);
-	bucket_insert_block(bucket, &m);
-}
-
-/*
- * heap_recycle_block -- (internal) recycles unused part of the memory block
- */
-static void
-heap_recycle_block(struct palloc_heap *heap, struct bucket *b,
-		struct memory_block *m, uint32_t units)
-{
-	if (b->aclass->type == CLASS_RUN) {
-		ASSERT(units <= UINT16_MAX);
-		ASSERT(m->block_off + units <= UINT16_MAX);
-		struct memory_block r = {m->chunk_id, m->zone_id,
-			m->size_idx - units, (uint16_t)(m->block_off + units),
-			0, 0, NULL, NULL};
-		memblock_rebuild_state(heap, &r);
-		bucket_insert_block(b, &r);
-	} else {
-		heap_resize_chunk(heap, b, m->chunk_id, m->zone_id, units);
-	}
-
-	m->size_idx = units;
+	return ret;
 }
 
 /*
@@ -885,20 +1862,29 @@ int
 heap_get_bestfit_block(struct palloc_heap *heap, struct bucket *b,
 	struct memory_block *m)
 {
+	ASSERTne(heap->rt->active_region, NULL);
+
+	int ret;
 	uint32_t units = m->size_idx;
 
 	while (b->c_ops->get_rm_bestfit(b->container, m) != 0) {
 		if (b->aclass->type == CLASS_HUGE) {
-			if (heap_ensure_huge_bucket_filled(heap, b) != 0)
-				return ENOMEM;
+			if ((ret = heap_ensure_huge_bucket_filled(heap, b,
+				units)) != 0) {
+				LOG(4, "!heap_ensure_huge_bucket_filled");
+				return ret;
+			}
 		} else {
-			if (heap_ensure_run_bucket_filled(heap, b, units) != 0)
-				return ENOMEM;
+			if ((ret = heap_ensure_run_bucket_filled(heap, b,
+			    units)) != 0) {
+				LOG(4, "!heap_ensure_run_bucket_filled");
+				return ret;
+			}
 		}
 	}
 
 	ASSERT(m->size_idx >= units);
-
+	ASSERT(heap_memblock_from_act_region(m));
 	if (units != m->size_idx)
 		heap_recycle_block(heap, b, m, units);
 
@@ -910,14 +1896,18 @@ heap_get_bestfit_block(struct palloc_heap *heap, struct bucket *b,
  */
 static int
 heap_get_adjacent_free_block(struct palloc_heap *heap,
-	const struct memory_block *in, struct memory_block *out, int prev)
+	const struct memory_block *in,
+	struct memory_block *out,
+	struct zone_region *region,
+	int prev)
 {
 	struct zone *z = ZID_TO_ZONE(heap->layout, in->zone_id);
 	struct chunk_header *hdr = &z->chunk_headers[in->chunk_id];
 	out->zone_id = in->zone_id;
 
 	if (prev) {
-		if (in->chunk_id == 0)
+		if (in->chunk_id == 0 ||
+		    in->chunk_id <= region->offset)
 			return ENOENT;
 
 		struct chunk_header *prev_hdr =
@@ -929,8 +1919,12 @@ heap_get_adjacent_free_block(struct palloc_heap *heap,
 
 		out->size_idx = z->chunk_headers[out->chunk_id].size_idx;
 	} else { /* next */
-		if (in->chunk_id + hdr->size_idx == z->header.size_idx)
+		/* crossing region boundary */
+		if (in->chunk_id + hdr->size_idx == z->header.size_idx ||
+		    in->chunk_id + hdr->size_idx >=
+		    HEAP_END_OF_REGION(region)) {
 			return ENOENT;
+		}
 
 		out->chunk_id = in->chunk_id + hdr->size_idx;
 
@@ -977,18 +1971,18 @@ heap_coalesce(struct palloc_heap *heap,
  */
 struct memory_block
 heap_coalesce_huge(struct palloc_heap *heap, struct bucket *b,
-	const struct memory_block *m)
+	const struct memory_block *m, struct zone_region *r)
 {
 	const struct memory_block *blocks[3] = {NULL, m, NULL};
 
 	struct memory_block prev = MEMORY_BLOCK_NONE;
-	if (heap_get_adjacent_free_block(heap, m, &prev, 1) == 0 &&
+	if (heap_get_adjacent_free_block(heap, m, &prev, r, 1) == 0 &&
 		b->c_ops->get_rm_exact(b->container, &prev) == 0) {
 		blocks[0] = &prev;
 	}
 
 	struct memory_block next = MEMORY_BLOCK_NONE;
-	if (heap_get_adjacent_free_block(heap, m, &next, 0) == 0 &&
+	if (heap_get_adjacent_free_block(heap, m, &next, r, 0) == 0 &&
 		b->c_ops->get_rm_exact(b->container, &next) == 0) {
 		blocks[2] = &next;
 	}
@@ -1013,7 +2007,7 @@ heap_end(struct palloc_heap *h)
  * heap_get_narenas -- (internal) returns the number of arenas to create
  */
 static unsigned
-heap_get_narenas(void)
+heap_get_narenas(struct palloc_heap *heap)
 {
 	long cpus = sysconf(_SC_NPROCESSORS_ONLN);
 	if (cpus < 1)
@@ -1074,8 +2068,6 @@ heap_buckets_init(struct palloc_heap *heap)
 	if (h->default_bucket == NULL)
 		goto error_bucket_create;
 
-	heap_populate_bucket(heap, h->default_bucket);
-
 	return 0;
 
 error_bucket_create:
@@ -1085,6 +2077,177 @@ error_bucket_create:
 	return -1;
 }
 
+int
+heap_boot_env(struct palloc_heap *heap, void *shm_start, size_t shm_size,
+	struct registry *registry, int init)
+{
+	LOG(3, "heap %p, shm_start %p shm_size %zu init %d", heap, shm_start,
+		shm_size, init);
+
+	COMPILE_ERROR_ON(OBJ_SHM_HEAP_SIZE < sizeof(struct heap_rt_shm));
+
+	struct heap_rt *h = heap->rt;
+
+	if (heap->mp_mode) {
+		if (shm_size < sizeof(struct heap_rt_shm))
+			FATAL("!shm_size given size %lu, needed %lu",
+				shm_size, sizeof(struct heap_rt_shm));
+
+		if ((h->shrd = (struct heap_rt_shm *)shm_start) == NULL)
+			FATAL("!shm_start is NULL");
+
+		h->registry = registry;
+	} else {
+		h->shrd = Malloc(sizeof(struct heap_rt_shm));
+		if (h->shrd == NULL)
+			FATAL("Malloc");
+	}
+
+	if (init) {
+		/*
+		 * we are the first process (primary) that opens the heap.
+		 * This section is protected by obj_boot(). Secondary
+		 * processes wait until state READY is reached.
+		 */
+		util_mutex_init_mp(&h->shrd->zone_trans_lock);
+
+		/*
+		 * if this lock fails there is not much we can do, since it
+		 * implies some global problem in the system.
+		 */
+		for (int i = 0; i < MAX_RUN_LOCKS; ++i)
+			util_mutex_init_mp(&h->shrd->run_locks[i]);
+
+		h->shrd->zones_exhausted = 0;
+	}
+
+	/*
+	 * assign zone and region, but don't populate the buckets, yet.
+	 * This has to be done here, because other functions rely on an
+	 * initialized region.
+	 */
+	if (heap_zone_assign(heap, &h->active_zone_id, 0 /* assign */) != 0)
+		return -1;
+
+	do {
+		uint32_t regions_in_use = ZID_TO_ZONE(heap->layout,
+			h->active_zone_id)->header.regions_in_use;
+
+		for (unsigned r_id = 0; r_id < regions_in_use; ++r_id) {
+			if (heap_region_claim(heap, r_id,
+				h->active_zone_id) == 0)
+				return 0;
+		}
+
+	} while (heap_zone_assign(heap, &h->active_zone_id, 1 /* new */) == 0);
+
+	return -1;
+}
+
+/*
+ * heap_region_reset -- (internal) cleanups an acquired region, such that
+ * locks are released and default values are set
+ *
+ * - searches in all regions of all zones for the given idx
+ *    - on match it is reset to zero
+ * - locks, whose owner died are marked as consistent
+ *
+ * XXX mp-mode -- should take an array of idxs
+ * to avoid traversing the regions multiple times in case several processes
+ * crashed.
+ */
+void
+heap_region_reset(const struct palloc_heap *heap, unsigned idx)
+{
+	LOG(4, "heap %p idx %i", heap, idx);
+
+	int realesed = 0;
+	for (unsigned z_id = 0; z_id < heap->rt->max_zone; ++z_id) {
+		struct zone *z = ZID_TO_ZONE(heap->layout, z_id);
+
+		if (z->header.magic == 0)
+			return;
+
+		uint16_t r_max = z->header.regions_in_use;
+		for (unsigned r_id = 0; r_id < r_max; ++r_id) {
+			struct zone_region *r = &z->regions[r_id];
+
+			if (r->claimant != idx)
+				continue;
+
+			/* check for unlocked regions */
+			int err = os_mutex_trylock(&r->lock);
+			switch (err) {
+				case EOWNERDEAD:
+					util_mutex_consistent(&r->lock);
+					/* don't break */
+				case 0:
+					util_mutex_unlock(&r->lock);
+					break;
+				default:
+					ERR("Unexpected lock error"
+					    "for region %d claimant %d",
+					    r->idx, r->claimant);
+			}
+			heap_region_reset_claimant(r);
+		}
+	}
+	ASSERT(realesed < 1);
+}
+
+struct zone_region *
+heap_get_region_by_chunk_id(struct palloc_heap *heap,
+	const struct memory_block *m)
+{
+	struct zone *z = ZID_TO_ZONE(heap->layout, m->zone_id);
+	for (unsigned r_id = 0; r_id < z->header.regions_in_use; ++r_id) {
+		struct zone_region *r = &z->regions[r_id];
+		if (HEAP_CHUNK_FROM_REGION(r, m->chunk_id)) {
+			return r;
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * heap_region_init_and_boot -- (internal) inits region runtime values
+ */
+static void
+heap_region_init_and_boot(const struct palloc_heap *heap)
+{
+	LOG(4, "heap %p", heap);
+
+	for (unsigned z_id = 0; z_id < heap->rt->max_zone; ++z_id) {
+		struct zone *z = ZID_TO_ZONE(heap->layout, z_id);
+
+		if (z->header.magic == 0)
+			return;
+
+		uint32_t r_max = z->header.regions_in_use;
+		for (unsigned r_id = 0; r_id < r_max; ++r_id) {
+			struct zone_region *r = &z->regions[r_id];
+			heap_region_reset_claimant(r);
+
+			/*
+			 * XXX mp-mode -- Placeholder for dynameic region sizes
+			 *
+			 * Once dyamic region sizes are implemented we have to
+			 * adopt the offset and size values here.
+			 */
+
+			/*
+			 * We overwrite the previous lock.
+			 * Such that we don't need to care about whether it was
+			 * previously locked and undefined behaviour, due to
+			 * reinitialization of an already initialized lock.
+			 */
+			if (heap->mp_mode)
+				util_mutex_init_mp(&r->lock);
+		}
+	}
+}
+
 /*
  * heap_boot -- opens the heap region of the pmemobj pool
  *
@@ -1092,7 +2255,8 @@ error_bucket_create:
  */
 int
 heap_boot(struct palloc_heap *heap, void *heap_start, uint64_t heap_size,
-		uint64_t run_id, void *base, struct pmem_ops *p_ops)
+    uint64_t run_id, void *base, struct pmem_ops *p_ops,
+    struct pmemobjpool *pop, int is_primary, unsigned proc_idx)
 {
 	struct heap_rt *h = Malloc(sizeof(*h));
 	int err;
@@ -1101,13 +2265,15 @@ heap_boot(struct palloc_heap *heap, void *heap_start, uint64_t heap_size,
 		goto error_heap_malloc;
 	}
 
+	h->active_region = NULL;
+	h->active_zone_id = 0;
 	h->alloc_classes = alloc_class_collection_new();
 	if (h->alloc_classes == NULL) {
 		err = ENOMEM;
 		goto error_alloc_classes_new;
 	}
 
-	h->narenas = heap_get_narenas();
+	h->narenas = heap_get_narenas(heap);
 	h->arenas = Malloc(sizeof(struct arena) * h->narenas);
 	if (h->arenas == NULL) {
 		err = ENOMEM;
@@ -1115,21 +2281,58 @@ heap_boot(struct palloc_heap *heap, void *heap_start, uint64_t heap_size,
 	}
 
 	h->max_zone = heap_max_zone(heap_size);
-	h->zones_exhausted = 0;
 
-	for (int i = 0; i < MAX_RUN_LOCKS; ++i)
-		util_mutex_init(&h->run_locks[i]);
+	if (heap->mp_mode) {
+		h->mtx_lock = heap_mutex_timedlock;
+		h->reclaim_garbage = heap_reclaim_garbage_mp;
+		h->populate_bucket = heap_populate_bucket_mp;
+
+		h->region_trans_lock_excl = heap_reg_trans_lock_excl_mp;
+		h->region_trans_lock_shrd = heap_reg_trans_lock_shrd_mp;
+		h->region_trans_release = heap_reg_trans_release_mp;
+
+		h->zone_trans_hold = heap_zone_trans_lock_mp;
+		h->zone_trans_release = heap_zone_trans_release_mp;
+
+		/*
+		 * XXX mp-mode -- temporary prototypical implementation
+		 * should be changed to cond_var or os_* variants for
+		 * portability reasons
+		 */
+		pthread_rwlockattr_t attr;
+		/* NP == non-portable */
+		pthread_rwlockattr_setkind_np(&attr,
+			PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+		pthread_rwlockattr_init(&attr);
+
+		if ((errno = pthread_rwlock_init(
+			(pthread_rwlock_t *)&h->rwlock, &attr)))
+			FATAL("!os_rwlock_init");
+	} else {
+		h->mtx_lock = os_mutex_lock;
+		h->reclaim_garbage = heap_reclaim_garbage;
+		h->populate_bucket = heap_populate_bucket;
+
+		h->region_trans_lock_excl = heap_region_trans_lock_excl;
+		h->region_trans_lock_shrd = heap_reg_trans_lock_shrd;
+		h->region_trans_release = heap_reg_trans_release;
+
+		h->zone_trans_hold = heap_zone_trans_lock;
+		h->zone_trans_release = heap_zone_trans_release;
+	}
 
 	util_mutex_init(&h->arenas_lock);
 
 	os_tls_key_create(&h->thread_arena, heap_thread_arena_destructor);
 
 	heap->run_id = run_id;
+	heap->proc_idx = proc_idx;
 	heap->p_ops = *p_ops;
 	heap->layout = heap_start;
 	heap->rt = h;
 	heap->size = heap_size;
 	heap->base = base;
+	heap->pop = pop;
 	VALGRIND_DO_CREATE_MEMPOOL(heap->layout, 0, 0);
 
 	for (unsigned i = 0; i < h->narenas; ++i)
@@ -1142,6 +2345,9 @@ heap_boot(struct palloc_heap *heap, void *heap_start, uint64_t heap_size,
 			goto error_recycler_new;
 		}
 	}
+
+	if (is_primary)
+		heap_region_init_and_boot(heap);
 
 	return 0;
 
@@ -1205,6 +2411,11 @@ heap_init(void *heap_start, uint64_t heap_size, struct pmem_ops *p_ops)
 				&ZID_TO_ZONE(layout, i)->chunk_headers,
 				0, sizeof(struct chunk_header));
 
+		/*
+		 * zone_regions are lazily initialized at runtime
+		 * in heap_region_init_and_boot() or heap_zone_init()
+		 */
+
 		/* only explicitly allocated chunks should be accessible */
 		VALGRIND_DO_MAKE_MEM_NOACCESS(
 			&ZID_TO_ZONE(layout, i)->chunk_headers,
@@ -1215,10 +2426,84 @@ heap_init(void *heap_start, uint64_t heap_size, struct pmem_ops *p_ops)
 }
 
 /*
+ * heap_runlock_cleanup -- (internal) destroy all shared run locks. Handles
+ * crashed locks.
+ */
+static void
+heap_runlock_cleanup(const struct heap_rt *h)
+{
+	LOG(4, NULL);
+
+	for (int i = 0; i < MAX_RUN_LOCKS; ++i)
+		util_mutex_destroy_shrd(&h->shrd->run_locks[i]);
+}
+
+/*
+ * heap_region_lock_cleanup -- (internal) destroys all region locks. Handles
+ * crashed locks.
+ */
+static void
+heap_region_lock_cleanup(struct palloc_heap *h)
+{
+	int err;
+	for (unsigned z_id = 0; z_id < h->rt->max_zone; ++z_id) {
+		struct zone *z = ZID_TO_ZONE(h->layout, z_id);
+
+		if (z->header.magic == 0)
+			return;
+
+		uint16_t r_max = z->header.regions_in_use;
+		for (unsigned r_id = 0; r_id < r_max; ++r_id) {
+			struct zone_region *r = &z->regions[r_id];
+
+			err = os_mutex_trylock(&r->lock);
+			switch (err) {
+				case EOWNERDEAD:
+					if (os_mutex_consistent(&r->lock)) {
+						ERR("!os_mutex_consistent");
+					}
+					LOG(3, "Detected a crashed process. "
+					    "Shuting down anyway");
+				case 0:
+					util_mutex_unlock(&r->lock);
+					break;
+				case EBUSY:
+					ERR("Unlocked lock detected.");
+				default:
+					ERR("Unexpected lock error, during "
+					    "shutdown. Destroying lock anyway. "
+					    "Undefined behaviour might happen. "
+					    "region %d claimant %d",
+					    r->idx, r->claimant);
+
+			}
+			util_mutex_destroy(&r->lock);
+		}
+	}
+}
+
+/*
+ * heap_cleanup_shm -- (internal) cleanups the shared volatile state
+ */
+void
+heap_cleanup_shm(struct palloc_heap *h)
+{
+	struct heap_rt_shm *shrd_rt = h->rt->shrd;
+
+	heap_runlock_cleanup(h->rt);
+
+	heap_region_lock_cleanup(h);
+
+	util_mutex_destroy(&shrd_rt->zone_trans_lock);
+	/* no free here -- deallocation happens in obj_shm_cleanup */
+	h->rt->shrd = NULL;
+}
+
+/*
  * heap_cleanup -- cleanups the volatile heap state
  */
 void
-heap_cleanup(struct palloc_heap *heap)
+heap_cleanup(struct palloc_heap *heap, int clean_shrd)
 {
 	struct heap_rt *rt = heap->rt;
 
@@ -1229,8 +2514,17 @@ heap_cleanup(struct palloc_heap *heap)
 	for (unsigned i = 0; i < rt->narenas; ++i)
 		heap_arena_destroy(&rt->arenas[i]);
 
-	for (int i = 0; i < MAX_RUN_LOCKS; ++i)
-		util_mutex_destroy(&rt->run_locks[i]);
+	heap_region_reset_claimant(heap->rt->active_region);
+
+	if (heap->mp_mode) {
+		util_rwlock_destroy(&rt->rwlock);
+
+		if (clean_shrd)
+			heap_cleanup_shm(heap);
+
+	} else {
+		Free(rt->shrd);
+	}
 
 	util_mutex_destroy(&rt->arenas_lock);
 
@@ -1337,6 +2631,16 @@ heap_verify_zone(struct zone *zone)
 		return -1;
 	}
 
+	/* verify regions */
+	uint32_t rchunks = 0;
+	for (int j = 0; j < MAX_PROCS; j++) {
+		rchunks += zone->regions[j].size;
+	}
+
+	if (rchunks != zone->header.size_idx) {
+		ERR("heap: region / chunk sizes mismatch");
+		return -1;
+	}
 	return 0;
 }
 
@@ -1611,6 +2915,7 @@ heap_vg_open(struct palloc_heap *heap, object_callback cb,
 		m.chunk_id = 0;
 
 		VALGRIND_DO_MAKE_MEM_DEFINED(&z->header, sizeof(z->header));
+		VALGRIND_DO_MAKE_MEM_DEFINED(&z->regions, sizeof(z->regions));
 
 		if (z->header.magic != ZONE_HEADER_MAGIC)
 			continue;

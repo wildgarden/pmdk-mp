@@ -40,7 +40,6 @@
 
 #include "valgrind_internal.h"
 #include "heap.h"
-#include "lane.h"
 #include "memops.h"
 #include "obj.h"
 #include "out.h"
@@ -101,7 +100,7 @@ pmalloc_redo_release(PMEMobjpool *pop)
  * If successful function returns zero. Otherwise an error number is returned.
  */
 int
-pmalloc_operation(struct palloc_heap *heap, uint64_t off, uint64_t *dest_off,
+pmalloc_operation(PMEMobjpool *pop, uint64_t off, uint64_t *dest_off,
 	size_t size, palloc_constr constructor, void *arg,
 	uint64_t extra_field, uint16_t flags,
 	struct operation_context *ctx)
@@ -111,13 +110,57 @@ pmalloc_operation(struct palloc_heap *heap, uint64_t off, uint64_t *dest_off,
 	if (size && On_valgrind && dest_off == NULL)
 		dest_off = &tmp;
 #endif
+	int err;
+again:
+	err = palloc_operation(&pop->heap, off, dest_off, size,
+		constructor, arg, extra_field, flags, ctx);
+	if (!err)
+		return 0;
 
-	int ret = palloc_operation(heap, off, dest_off, size, constructor, arg,
-			extra_field, flags, ctx);
-	if (ret)
-		return ret;
+	if (pop->mp_mode) {
+		switch (errno) {
+			case ENOMEM:
+				/*
+				 * We could run recovery here, to make sure that
+				 * no other process left a region behind that
+				 * has some free space. However, we might then
+				 * have to cope with different threads. Only one
+				 * thread should run recovery.
+				 *
+				 * So its better to leave this decision
+				 * up to the caller, such that he can choose
+				 * to investigate the situation and when
+				 * recovery is started, respectively.
+				 */
+				break;
+			case EOWNERDEAD:
+				/*
+				 * We encountered a dead process while
+				 * acquiring a lock and need to either close and
+				 * reopen the pool or run recovery.
+				 */
+				if (obj_crash_check_and_recover(pop) == 0) {
+					LOG(7, "retrying after recovery");
+					goto again;
+				}
+				break;
+			case ETIMEDOUT:
+				/*
+				 * We don't know the exact reason for the
+				 * timeout. The culprit might continue his work,
+				 * freeze / starve or eventually crash.
+				 *
+				 * Thus it's best to leave error handling
+				 * up to the callers, such that he
+				 * can investigate and decide the following
+				 * actions
+				 */
+			default:
+				break;
+		}
+	}
 
-	return 0;
+	return -1;
 }
 
 /*
@@ -134,9 +177,9 @@ pmalloc(PMEMobjpool *pop, uint64_t *off, size_t size,
 	struct redo_log *redo = pmalloc_redo_hold(pop);
 
 	struct operation_context ctx;
-	operation_init(&ctx, pop, pop->redo, redo);
+	operation_init(&ctx, pop->base_addr, pop->redo, redo);
 
-	int ret = pmalloc_operation(&pop->heap, 0, off, size, NULL, NULL,
+	int ret = pmalloc_operation(pop, 0, off, size, NULL, NULL,
 		extra_field, flags, &ctx);
 
 	pmalloc_redo_release(pop);
@@ -162,7 +205,7 @@ pmalloc_construct(PMEMobjpool *pop, uint64_t *off, size_t size,
 
 	operation_init(&ctx, pop, pop->redo, redo);
 
-	int ret = pmalloc_operation(&pop->heap, 0, off, size, constructor, arg,
+	int ret = pmalloc_operation(pop, 0, off, size, constructor, arg,
 			extra_field, flags, &ctx);
 
 	pmalloc_redo_release(pop);
@@ -186,7 +229,7 @@ prealloc(PMEMobjpool *pop, uint64_t *off, size_t size,
 
 	operation_init(&ctx, pop, pop->redo, redo);
 
-	int ret = pmalloc_operation(&pop->heap, *off, off, size, NULL, NULL,
+	int ret = pmalloc_operation(pop, *off, off, size, NULL, NULL,
 		extra_field, flags, &ctx);
 
 	pmalloc_redo_release(pop);
@@ -201,7 +244,7 @@ prealloc(PMEMobjpool *pop, uint64_t *off, size_t size,
  *
  * If successful function returns zero. Otherwise an error number is returned.
  */
-void
+int
 pfree(PMEMobjpool *pop, uint64_t *off)
 {
 	struct redo_log *redo = pmalloc_redo_hold(pop);
@@ -209,11 +252,15 @@ pfree(PMEMobjpool *pop, uint64_t *off)
 
 	operation_init(&ctx, pop, pop->redo, redo);
 
-	int ret = pmalloc_operation(&pop->heap, *off, off, 0, NULL, NULL,
+	int ret = pmalloc_operation(pop, *off, off, 0, NULL, NULL,
 		0, 0, &ctx);
-	ASSERTeq(ret, 0);
+
+	if (!pop->mp_mode)
+		ASSERTeq(ret, 0);
 
 	pmalloc_redo_release(pop);
+
+	return ret;
 }
 
 /*
@@ -271,8 +318,11 @@ pmalloc_check(PMEMobjpool *pop, void *data, unsigned length)
 static int
 pmalloc_boot(PMEMobjpool *pop)
 {
-	int ret = palloc_boot(&pop->heap, (char *)pop + pop->heap_offset,
-			pop->heap_size, pop->run_id, pop, &pop->p_ops);
+	pop->heap.mp_mode = pop->mp_mode;
+	int ret = palloc_boot(&pop->heap,
+	    (char *)pop->base_addr + pop->pool_desc->heap_offset,
+	    pop->pool_desc->heap_size, pop->pool_desc->run_id, pop->base_addr,
+	    &pop->p_ops, pop, pop->is_primary, pop->proc_idx);
 	if (ret)
 		return ret;
 
@@ -280,9 +330,16 @@ pmalloc_boot(PMEMobjpool *pop)
 	palloc_heap_vg_open(&pop->heap, pop->vg_boot);
 #endif
 
-	ret = palloc_buckets_init(&pop->heap);
+	ret = palloc_boot_env(&pop->heap, pop->shrd->shm_heap,
+		OBJ_SHM_HEAP_SIZE, pop->registry, pop->is_primary);
 	if (ret)
-		palloc_heap_cleanup(&pop->heap);
+		return ret;
+
+	ret = palloc_buckets_init(&pop->heap);
+	if (ret) {
+		if (pop->mp_mode)
+			palloc_heap_cleanup(&pop->heap, pop->is_primary);
+	}
 
 	return ret;
 }

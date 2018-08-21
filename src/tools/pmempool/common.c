@@ -677,7 +677,8 @@ pmem_pool_parse_params(const char *fname, struct pmem_pool_params *paramsp,
 		paramsp->blk.bsize = le32toh(pbp->bsize);
 	} else if (paramsp->type == PMEM_POOL_TYPE_OBJ) {
 		struct pmemobjpool *pop = addr;
-		memcpy(paramsp->obj.layout, pop->layout, PMEMOBJ_MAX_LAYOUT);
+		memcpy(paramsp->obj.layout, pop->pool_desc->layout,
+		    PMEMOBJ_MAX_LAYOUT);
 	}
 
 	if (paramsp->is_poolset)

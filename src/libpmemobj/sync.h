@@ -39,10 +39,42 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <fcntl.h>
 
 #include "libpmemobj.h"
 #include "out.h"
 #include "os_thread.h"
+#include "obj.h"
+
+/*
+ * macros for file locking
+ * copied from APUE
+ */
+int
+lock_reg(int, int, short int, off_t, short int, off_t);
+#define read_lock(fd, offset, whence, len) \
+lock_reg((fd), F_SETLK, F_RDLCK, (offset), (whence), (len))
+
+#define readw_lock(fd, offset, whence, len) \
+lock_reg((fd), F_SETLKW, F_RDLCK, (offset), (whence), (len))
+
+#define write_lock(fd, offset, whence, len) \
+lock_reg((fd), F_SETLK, F_WRLCK, (offset), (whence), (len))
+
+#define writew_lock(fd, offset, whence, len) \
+lock_reg((fd), F_SETLKW, F_WRLCK, (offset), (whence), (len))
+
+#define un_lock(fd, offset, whence, len) \
+lock_reg((fd), F_SETLK, F_UNLCK, (offset), (whence), (len))
+
+pid_t
+lock_test(int, short int, off_t, short int, off_t);
+
+#define is_read_lockable(fd, offset, whence, len) \
+(lock_test((fd), F_RDLCK, (offset), (whence), (len)) == 0)
+
+#define is_write_lockable(fd, offset, whence, len) \
+(lock_test((fd), F_WRLCK, (offset), (whence), (len)) == 0)
 
 /*
  * internal definitions of PMEM-locks
@@ -79,7 +111,7 @@ typedef union padded_pmemcond {
 static inline void
 pmemobj_mutex_lock_nofail(PMEMobjpool *pop, PMEMmutex *mutexp)
 {
-	int ret = pmemobj_mutex_lock(pop, mutexp);
+	int ret = pop->pmem_lock(pop, mutexp);
 	if (ret) {
 		errno = ret;
 		FATAL("!pmemobj_mutex_lock");
@@ -94,7 +126,7 @@ pmemobj_mutex_lock_nofail(PMEMobjpool *pop, PMEMmutex *mutexp)
 static inline void
 pmemobj_mutex_unlock_nofail(PMEMobjpool *pop, PMEMmutex *mutexp)
 {
-	int ret = pmemobj_mutex_unlock(pop, mutexp);
+	int ret = pop->pmem_unlock(pop, mutexp);
 	if (ret) {
 		errno = ret;
 		FATAL("!pmemobj_mutex_unlock");

@@ -46,14 +46,14 @@
 #include "alloc_class.h"
 #include "valgrind_internal.h"
 
-#define MOCK_POOL_SIZE PMEMOBJ_MIN_POOL
+#define MOCK_POOL_SIZE (PMEMOBJ_MIN_POOL * 3)
 
 #define MAX_BLOCKS 3
 
 #define TEST_RUN_ID 5
 
 struct mock_pop {
-	PMEMobjpool p;
+	PMEMobjpool *p;
 	void *heap;
 };
 
@@ -186,25 +186,39 @@ test_heap(void)
 {
 	struct mock_pop *mpop = MMAP_ANON_ALIGNED(MOCK_POOL_SIZE,
 		Ut_mmap_align);
-	PMEMobjpool *pop = &mpop->p;
-	memset(pop, 0, MOCK_POOL_SIZE);
+	PMEMobjpool *pop = pmemobjpool_new();
+	pop->base_addr = mpop;
+	memset(pop->base_addr, 0, MOCK_POOL_SIZE);
+	mpop->p = pop;
 	pop->size = MOCK_POOL_SIZE;
-	pop->heap_size = MOCK_POOL_SIZE - sizeof(PMEMobjpool);
-	pop->heap_offset = (uint64_t)((uint64_t)&mpop->heap - (uint64_t)mpop);
+	pop->pool_desc = (void *)((uintptr_t)pop->base_addr + POOL_HDR_SIZE);
+	pop->pool_desc->heap_size = MOCK_POOL_SIZE - sizeof(PMEMobjpool);
+	pop->pool_desc->heap_offset = (uint64_t)((uint64_t)&mpop->heap -
+	    (uint64_t)mpop);
 	pop->p_ops.persist = obj_heap_persist;
 	pop->p_ops.memset_persist = obj_heap_memset_persist;
 	pop->p_ops.base = pop;
+	pop->p_ops.base_p = pop->base_addr;
 	pop->p_ops.pool_size = pop->size;
 
-	void *heap_start = (char *)pop + pop->heap_offset;
-	uint64_t heap_size = pop->heap_size;
+	void *heap_start = (char *)pop->base_addr + pop->pool_desc->heap_offset;
+	uint64_t heap_size = pop->pool_desc->heap_size;
 	struct palloc_heap *heap = &pop->heap;
 	struct pmem_ops *p_ops = &pop->p_ops;
 
 	UT_ASSERT(heap_check(heap_start, heap_size) != 0);
 	UT_ASSERT(heap_init(heap_start, heap_size, p_ops) == 0);
-	UT_ASSERT(heap_boot(heap, heap_start, heap_size, TEST_RUN_ID,
-		pop, p_ops) == 0);
+	UT_ASSERT(
+	    heap_boot(heap, heap_start, heap_size, TEST_RUN_ID, pop, p_ops,
+		heap->pop, 1, 0) == 0);
+
+	if (pop->mp_mode)
+		UT_ASSERT(heap_boot_env(heap, pop->shrd->shm_heap,
+			OBJ_SHM_HEAP_SIZE, pop->registry, 1 /* init */) == 0);
+	else
+		UT_ASSERT(heap_boot_env(heap, NULL,
+			0, NULL, 1 /* init */) == 0);
+
 	UT_ASSERT(heap_buckets_init(heap) == 0);
 	UT_ASSERT(pop->heap.rt != NULL);
 
@@ -233,6 +247,8 @@ test_heap(void)
 	struct bucket *b_def = heap_bucket_acquire_by_id(heap,
 		DEFAULT_ALLOC_CLASS_ID);
 
+	UT_ASSERTne(b_def, NULL);
+
 	for (int i = 0; i < MAX_BLOCKS; ++i) {
 		heap_get_bestfit_block(heap, b_def, &blocks[i]);
 		UT_ASSERT(blocks[i].block_off == 0);
@@ -244,10 +260,14 @@ test_heap(void)
 	struct alloc_class *c_run = heap_get_best_class(heap, 1024);
 	struct bucket *b_run = heap_bucket_acquire(heap, c_run);
 
+	UT_ASSERTne(b_run, NULL);
+
 	/*
 	 * Allocate blocks from a run until one run is exhausted an another is
 	 * created.
 	 */
+	heap_region_trans_lock_shrd(heap);
+
 	UT_ASSERTne(heap_get_bestfit_block(heap, b_run, &old_run), ENOMEM);
 	UT_ASSERTeq(old_run.m_ops->claim(&old_run), -1);
 
@@ -266,9 +286,13 @@ test_heap(void)
 	heap_bucket_release(heap, b_run);
 
 	UT_ASSERT(heap_check(heap_start, heap_size) == 0);
-	heap_cleanup(heap);
+
+	heap_region_trans_release(heap);
+
+	heap_cleanup(heap, 0);
 	UT_ASSERT(heap->rt == NULL);
 
+	FREE(mpop->p);
 	MUNMAP_ANON_ALIGNED(mpop, MOCK_POOL_SIZE);
 }
 
@@ -277,25 +301,38 @@ test_recycler(void)
 {
 	struct mock_pop *mpop = MMAP_ANON_ALIGNED(MOCK_POOL_SIZE,
 		Ut_mmap_align);
-	PMEMobjpool *pop = &mpop->p;
-	memset(pop, 0, MOCK_POOL_SIZE);
+	PMEMobjpool *pop = pmemobjpool_new();
+	pop->base_addr = mpop;
+	memset(pop->base_addr, 0, MOCK_POOL_SIZE);
+	mpop->p = pop;
 	pop->size = MOCK_POOL_SIZE;
-	pop->heap_size = MOCK_POOL_SIZE - sizeof(PMEMobjpool);
-	pop->heap_offset = (uint64_t)((uint64_t)&mpop->heap - (uint64_t)mpop);
+	pop->pool_desc = (void *)((uintptr_t)pop->base_addr + POOL_HDR_SIZE);
+	pop->pool_desc->heap_size = MOCK_POOL_SIZE - sizeof(PMEMobjpool);
+	pop->pool_desc->heap_offset = (uint64_t)((uint64_t)&mpop->heap -
+		(uint64_t)mpop);
 	pop->p_ops.persist = obj_heap_persist;
 	pop->p_ops.memset_persist = obj_heap_memset_persist;
 	pop->p_ops.base = pop;
 	pop->p_ops.pool_size = pop->size;
 
-	void *heap_start = (char *)pop + pop->heap_offset;
-	uint64_t heap_size = pop->heap_size;
+	void *heap_start = (char *)pop->base_addr + pop->pool_desc->heap_offset;
+	uint64_t heap_size = pop->pool_desc->heap_size;
 	struct palloc_heap *heap = &pop->heap;
 	struct pmem_ops *p_ops = &pop->p_ops;
 
 	UT_ASSERT(heap_check(heap_start, heap_size) != 0);
 	UT_ASSERT(heap_init(heap_start, heap_size, p_ops) == 0);
-	UT_ASSERT(heap_boot(heap, heap_start, heap_size, TEST_RUN_ID,
-		pop, p_ops) == 0);
+	UT_ASSERT(
+	    heap_boot(heap, heap_start, heap_size, TEST_RUN_ID, pop, p_ops,
+		heap->pop, 1, 0) == 0);
+
+	if (pop->mp_mode)
+		UT_ASSERT(heap_boot_env(heap, pop->shrd->shm_heap,
+			OBJ_SHM_HEAP_SIZE, pop->registry, 1 /* init */) == 0);
+	else
+		UT_ASSERT(heap_boot_env(heap, NULL,
+			0, NULL, 1 /* init */) == 0);
+
 	UT_ASSERT(heap_buckets_init(heap) == 0);
 	UT_ASSERT(pop->heap.rt != NULL);
 
@@ -361,9 +398,9 @@ test_recycler(void)
 
 	recycler_delete(r);
 
-	heap_cleanup(heap);
+	heap_cleanup(heap, 0);
 	UT_ASSERT(heap->rt == NULL);
-
+	pmemobjpool_delete(mpop->p);
 	MUNMAP_ANON_ALIGNED(mpop, MOCK_POOL_SIZE);
 }
 
@@ -371,7 +408,6 @@ int
 main(int argc, char *argv[])
 {
 	START(argc, argv, "obj_heap");
-
 	test_heap();
 	test_recycler();
 

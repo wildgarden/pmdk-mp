@@ -55,7 +55,8 @@ EXAMPLES=$(EX_LIBPMEMOBJ)/pi \
 	$(EX_LIBPMEMOBJ)/pmemlog/obj_pmemlog \
 	$(EX_LIBPMEMOBJ)/pmemlog/obj_pmemlog_minimal \
 	$(EX_LIBPMEMOBJ)/pmemlog/obj_pmemlog_simple \
-	$(EX_LIBPMEMOBJ)/pmemlog/obj_pmemlog_macros
+	$(EX_LIBPMEMOBJ)/pmemlog/obj_pmemlog_macros \
+	$(EX_LIBPMEMOBJ)/reader_writer \
 
 ifeq ($(NCURSES),y)
 EXAMPLES += $(EX_LIBPMEMOBJ)/pminvaders/pminvaders

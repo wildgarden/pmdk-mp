@@ -40,6 +40,8 @@
 #include "rpmemd_fip_worker.h"
 #define FATAL RPMEMD_FATAL
 #define ERR RPMEMD_ERR
+/* assert a condition is true */
+#define ASSERT RPMEMD_ASSERT
 #include "sys_util.h"
 
 /*

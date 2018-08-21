@@ -49,8 +49,8 @@ configure_valgrind memcheck force-enable
 require_build_type debug
 
 setup
-
-create_holey_file 16M $DIR/testfile1
+MIN_POOL_SIZE=$((8*1024*1024*16))
+create_holey_file $MIN_POOL_SIZE $DIR/testfile1
 
 # This is a pretty length test on non-pmem devices, so force clflushes.
 export PMEM_IS_PMEM_FORCE=1

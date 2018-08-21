@@ -100,6 +100,8 @@ ifeq ($(call check_librt), n)
 LIBS += -lrt
 endif
 
+LIBS += -lrt
+
 ifeq ($(TOOLS_COMMON), y)
 LIBPMEMCOMMON=y
 endif

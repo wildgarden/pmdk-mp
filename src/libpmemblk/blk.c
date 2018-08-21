@@ -419,7 +419,7 @@ pmemblk_createU(const char *path, size_t bsize, size_t poolsize, mode_t mode)
 			BLK_HDR_SIG, BLK_FORMAT_MAJOR,
 			BLK_FORMAT_COMPAT, BLK_FORMAT_INCOMPAT,
 			BLK_FORMAT_RO_COMPAT, NULL,
-			REPLICAS_DISABLED) != 0) {
+			REPLICAS_DISABLED, 1 /* flock */) != 0) {
 		LOG(2, "cannot create pool or pool set");
 		return NULL;
 	}

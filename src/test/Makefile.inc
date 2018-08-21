@@ -75,8 +75,12 @@ endif
 
 ifeq ($(LIBPMEMPOOL), y)
 DYNAMIC_LIBS += -lpmempool
+DYNAMIC_LIBS += -lrt
 STATIC_DEBUG_LIBS += $(LIBS_DIR)/debug/libpmempool.a
+STATIC_DEBUG_LIBS += -lrt
 STATIC_NONDEBUG_LIBS += $(LIBS_DIR)/nondebug/libpmempool.a
+STATIC_NONDEBUG_LIBS += -lrt
+LIBS += -lrt
 LIBS += -ldl
 CFLAGS += -DUSE_LIBDL
 endif
@@ -96,8 +100,11 @@ endif
 ifeq ($(LIBPMEMOBJ), y)
 LIBS += -ldl
 DYNAMIC_LIBS += -lpmemobj
+DYNAMIC_LIBS += -lrt
 STATIC_DEBUG_LIBS += $(LIBS_DIR)/debug/libpmemobj.a
+STATIC_DEBUG_LIBS += -lrt
 STATIC_NONDEBUG_LIBS += $(LIBS_DIR)/nondebug/libpmemobj.a
+STATIC_NONDEBUG_LIBS += -lrt
 endif
 
 ifeq ($(LIBPMEMOBJ), internal-debug)
@@ -121,6 +128,8 @@ OBJS += $(TOP)/src/debug/libpmemobj/alloc_class.o\
 	$(TOP)/src/debug/libpmemobj/pvector.o\
 	$(TOP)/src/debug/libpmemobj/recycler.o\
 	$(TOP)/src/debug/libpmemobj/redo.o\
+	$(TOP)/src/debug/libpmemobj/registry.o\
+	$(TOP)/src/debug/libpmemobj/shm_list.o\
 	$(TOP)/src/debug/libpmemobj/ringbuf.o\
 	$(TOP)/src/debug/libpmemobj/sync.o\
 	$(TOP)/src/debug/libpmemobj/tx.o
@@ -152,6 +161,7 @@ OBJS += $(TOP)/src/nondebug/libpmemobj/alloc_class.o\
 	$(TOP)/src/nondebug/libpmemobj/pvector.o\
 	$(TOP)/src/nondebug/libpmemobj/recycler.o\
 	$(TOP)/src/nondebug/libpmemobj/redo.o\
+	$(TOP)/src/nondebug/libpmemobj/registry.o\
 	$(TOP)/src/nondebug/libpmemobj/ringbuf.o\
 	$(TOP)/src/nondebug/libpmemobj/sync.o\
 	$(TOP)/src/nondebug/libpmemobj/tx.o
@@ -170,8 +180,11 @@ endif
 
 ifeq ($(LIBPMEM),y)
 DYNAMIC_LIBS += -lpmem
+DYNAMIC_LIBS += -lrt
 STATIC_DEBUG_LIBS += $(LIBS_DIR)/debug/libpmem.a
+STATIC_DEBUG_LIBS += -lrt
 STATIC_NONDEBUG_LIBS += $(LIBS_DIR)/nondebug/libpmem.a
+STATIC_NONDEBUG_LIBS += -lrt
 endif
 
 ifeq ($(LIBRPMEM),y)
@@ -182,8 +195,11 @@ endif
 
 ifeq ($(LIBVMEM),y)
 DYNAMIC_LIBS += -lvmem
+DYNAMIC_LIBS += -lrt
 STATIC_DEBUG_LIBS += $(LIBS_DIR)/debug/libvmem.a
+STATIC_DEBUG_LIBS += -lrt
 STATIC_NONDEBUG_LIBS += $(LIBS_DIR)/nondebug/libvmem.a
+STATIC_NONDEBUG_LIBS += -lrt
 endif
 
 #

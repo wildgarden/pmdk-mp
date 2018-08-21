@@ -40,3 +40,6 @@ LIBPMEM=y
 LIBPMEMOBJ=internal-debug
 
 include ../Makefile.inc
+
+# needed to mock registry_check_crashed
+LDFLAGS += $(call extract_funcs, obj_pmalloc_basic.c)

@@ -40,7 +40,7 @@ OBJS = pmemalloc.o
 LIBPMEM=y
 LIBPMEMCOMMON=y
 LIBPMEMOBJ=y
-
+LIBS += -lrt
 CFLAGS += -I$(TOP)/src/libpmemobj
 
 include $(TOP)/src/tools/Makefile.inc

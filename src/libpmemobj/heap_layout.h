@@ -39,6 +39,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "os_thread.h"
+#include "mp.h"
 
 #define HEAP_MAJOR 1
 #define HEAP_MINOR 0
@@ -101,14 +103,75 @@ struct chunk_header {
 	uint32_t size_idx;
 };
 
+/*
+ * The region structure is used to subdevide zones.
+ *
+ * Although this struct is located in pmem, it is only used as transient
+ * memory which is reinitialized at runtime. The reason why it is located in
+ * PMEM is, that we don't know at programm start how many regions we need.
+ * Moreover in future implementations the heap might be extended at runtime,
+ * e.g., when an OOM event happened.
+ * But technically, if we only support a fixed number, we could move
+ * this struct to an array in struct heap_rt_shm.
+ *
+ * A region is
+ * - private to each process (process exclusive memory once it is assigned)
+ * - no shared locking with the exception to free operations. When other
+ * processes need to free memory from our region, only then the region is
+ * locked.
+ *
+ * Each process
+ * - has only one active region at a time
+ * - allocates only from that region.
+ * - on region transitions the access is protected via a exclusive lock,
+ *   and the transient state has to rebuild afterwards. Other than that, the
+ *   lock has no contention, because it is only locked as long the default
+ *   bucket is hold.
+ */
+struct zone_region {
+	/* index inside the zone (for convenience) */
+	uint32_t idx;
+
+	/* offset in chunks from the beginning of the zone */
+	uint32_t offset;
+
+	/* in chunks - dynamically sized - */
+	uint32_t size;
+
+	/*
+	 * process id of the current owner
+	 * used as local lock:
+	 * 0 free, otherwise locked
+	 */
+	uint32_t claimant;
+
+	/*
+	 * This lock must be aquired by a process to free memory
+	 * from a region that is claimend by another process
+	 */
+	os_mutex_t lock;
+};
+
 struct zone_header {
 	uint32_t magic;
-	uint32_t size_idx;
+	uint16_t size_idx;
+
+	/*
+	 * holds the number of used regions
+	 *
+	 * In case the zone size is not evenly divisible by MAX_REGIONS,
+	 * the region before the last regions becomes greater instead of
+	 * ending with a tiny region.
+	 *
+	 * see heap_zone_init() for details
+	 */
+	uint16_t regions_in_use;
 	uint8_t reserved[56];
 };
 
 struct zone {
 	struct zone_header header;
+	struct zone_region regions[MAX_REGIONS];
 	struct chunk_header chunk_headers[MAX_CHUNK];
 	struct chunk chunks[];
 };

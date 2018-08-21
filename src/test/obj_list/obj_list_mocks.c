@@ -61,7 +61,7 @@ obj_persist(void *ctx, const void *addr, size_t len)
 static void
 obj_flush(void *ctx, const void *addr, size_t len)
 {
-	PMEMobjpool *pop = (PMEMobjpool *)ctx;
+	PMEMobjpool *pop = ctx;
 	pop->flush_local(addr, len);
 }
 
@@ -71,7 +71,7 @@ obj_flush(void *ctx, const void *addr, size_t len)
 static void
 obj_drain(void *ctx)
 {
-	PMEMobjpool *pop = (PMEMobjpool *)ctx;
+	PMEMobjpool *pop = ctx;
 	pop->drain_local();
 }
 
@@ -95,7 +95,7 @@ linear_alloc(uint64_t *cur_offset, size_t size)
 static int
 redo_log_check_offset(void *ctx, uint64_t offset)
 {
-	PMEMobjpool *pop = (PMEMobjpool *)ctx;
+	PMEMobjpool *pop = ctx;
 	return OBJ_OFF_IS_VALID(pop, offset);
 }
 
@@ -116,9 +116,9 @@ FUNC_MOCK_RUN_DEFAULT
 		UT_OUT("!%s: pmem_map_file", fname);
 		return NULL;
 	}
-
-	Pop = (PMEMobjpool *)addr;
-	Pop->addr = Pop;
+	Pop = pmemobjpool_new();
+	Pop->addr = addr;
+	Pop->base_addr = addr;
 	Pop->size = size;
 	Pop->is_pmem = is_pmem;
 	Pop->rdonly = 0;
@@ -140,18 +140,22 @@ FUNC_MOCK_RUN_DEFAULT
 	Pop->p_ops.base = Pop;
 	struct pmem_ops *p_ops = &Pop->p_ops;
 
-	Pop->heap_offset = HEAP_OFFSET;
-	Pop->heap_size = Pop->size - Pop->heap_offset;
+	Pop->pmem_lock = pmemobj_mutex_lock;
+	Pop->pmem_unlock = pmemobj_mutex_unlock;
+
+	Pop->pool_desc = (void *)((uintptr_t)Pop->base_addr + POOL_HDR_SIZE);
+	Pop->pool_desc->heap_size = Pop->size - Pop->pool_desc->heap_offset;
 	uint64_t heap_offset = HEAP_OFFSET;
 
-	Heap_offset = (uint64_t *)((uintptr_t)Pop +
+	Heap_offset = (uint64_t *)((uintptr_t)Pop->base_addr +
 			linear_alloc(&heap_offset, sizeof(*Heap_offset)));
 
-	Id = (int *)((uintptr_t)Pop + linear_alloc(&heap_offset, sizeof(*Id)));
+	Id = (int *)((uintptr_t)Pop->base_addr + linear_alloc(&heap_offset,
+		sizeof(*Id)));
 
 	/* Alloc lane layout */
-	Lane_section.layout = (struct lane_section_layout *)((uintptr_t)Pop +
-			linear_alloc(&heap_offset, LANE_SECTION_LEN));
+	Lane_section.layout = (struct lane_section_layout *)((uintptr_t)Pop
+	    ->base_addr + linear_alloc(&heap_offset, LANE_SECTION_LEN));
 
 	/* Alloc in band lists */
 	List.oid.pool_uuid_lo = Pop->uuid_lo;
@@ -168,7 +172,7 @@ FUNC_MOCK_RUN_DEFAULT
 	List_oob_sec.oid.off =
 			linear_alloc(&heap_offset, sizeof(struct oob_list));
 
-	Item = (union oob_item_toid *)((uintptr_t)Pop +
+	Item = (union oob_item_toid *)((uintptr_t)Pop->base_addr +
 			linear_alloc(&heap_offset, sizeof(*Item)));
 	Item->oid.pool_uuid_lo = Pop->uuid_lo;
 	Item->oid.off = linear_alloc(&heap_offset, sizeof(struct oob_item));
@@ -179,13 +183,14 @@ FUNC_MOCK_RUN_DEFAULT
 		pmemops_persist(p_ops, Heap_offset, sizeof(*Heap_offset));
 	}
 
-	pmemops_persist(p_ops, Pop, HEAP_OFFSET);
+	pmemops_persist(p_ops, Pop->base_addr, HEAP_OFFSET);
 
-	Pop->run_id += 2;
-	pmemops_persist(p_ops, &Pop->run_id, sizeof(Pop->run_id));
+	Pop->pool_desc->run_id += 2;
+	pmemops_persist(p_ops, &Pop->pool_desc->run_id,
+	    sizeof(Pop->pool_desc->run_id));
 
-	Pop->redo = redo_log_config_new(Pop->addr, p_ops, redo_log_check_offset,
-			Pop, REDO_NUM_ENTRIES);
+	Pop->redo = redo_log_config_new(Pop->base_addr, p_ops,
+	    redo_log_check_offset, Pop, REDO_NUM_ENTRIES);
 	pmemops_persist(p_ops, &Pop->redo, sizeof(Pop->redo));
 
 	return Pop;
@@ -200,7 +205,8 @@ FUNC_MOCK_END
 FUNC_MOCK(pmemobj_close, void, PMEMobjpool *pop)
 	FUNC_MOCK_RUN_DEFAULT {
 		redo_log_config_delete(Pop->redo);
-		UT_ASSERTeq(pmem_unmap(Pop, Pop->size), 0);
+		UT_ASSERTeq(pmem_unmap(Pop->base_addr, Pop->size), 0);
+		FREE(pop);
 		Pop = NULL;
 	}
 FUNC_MOCK_END
@@ -217,7 +223,7 @@ FUNC_MOCK_RET_ALWAYS(pmemobj_pool_by_ptr, PMEMobjpool *, Pop, const void *ptr);
  */
 FUNC_MOCK(pmemobj_direct, void *, PMEMoid oid)
 	FUNC_MOCK_RUN_DEFAULT {
-		return (void *)((uintptr_t)Pop + oid.off);
+		return (void *)((uintptr_t)Pop->base_addr + oid.off);
 	}
 FUNC_MOCK_END
 

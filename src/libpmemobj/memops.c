@@ -138,16 +138,16 @@ operation_add_entry(struct operation_context *ctx, void *ptr, uint64_t value,
 	enum operation_type type)
 {
 	const struct pmem_ops *p_ops = ctx->p_ops;
-
-	int from_pool = ((uintptr_t)ptr >= (uintptr_t)p_ops->base &&
-			(uintptr_t)ptr < (uintptr_t)p_ops->base +
+	int from_pool = ((uintptr_t)ptr >= (uintptr_t)p_ops->base_p &&
+			(uintptr_t)ptr < (uintptr_t)p_ops->base_p +
 				p_ops->pool_size);
 
-	ASSERTeq(from_pool, OBJ_OFF_IS_VALID((struct pmemobjpool *)p_ops->base,
-		(uintptr_t)ptr - (uintptr_t)p_ops->base));
+	int valid = OBJ_OFF_IS_VALID((struct pmemobjpool *)p_ops->base,
+		    (uintptr_t)ptr - (uintptr_t)p_ops->base_p);
+	ASSERTeq(from_pool, valid);
 
 	operation_add_typed_entry(ctx, ptr, value, type,
-		from_pool ? ENTRY_PERSISTENT : ENTRY_TRANSIENT);
+	    from_pool ? ENTRY_PERSISTENT : ENTRY_TRANSIENT);
 }
 
 /*
@@ -163,9 +163,8 @@ operation_process_persistent_redo(struct operation_context *ctx)
 	for (i = 0; i < ctx->nentries[ENTRY_PERSISTENT]; ++i) {
 		e = &ctx->entries[ENTRY_PERSISTENT][i];
 
-		redo_log_store(redo, ctx->redo, i,
-				(uintptr_t)e->ptr - (uintptr_t)ctx->base,
-				e->value);
+		redo_log_store(redo, ctx->redo, i, (uintptr_t)e->ptr -
+		    (uintptr_t)redo_get_base_addr(redo), e->value);
 	}
 
 	redo_log_set_last(redo, ctx->redo, i - 1);

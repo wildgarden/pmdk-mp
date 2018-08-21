@@ -231,7 +231,8 @@ rpmemd_db_pool_create(struct rpmemd_db *db, const char *pool_desc,
 					NULL,
 					REPLICAS_DISABLED,
 					POOL_REMOTE,
-					&pattr);
+					&pattr,
+					1 /* flock */);
 	if (ret) {
 		RPMEMD_LOG(ERR, "!cannot create pool set -- '%s'", path);
 		goto err_free_path;

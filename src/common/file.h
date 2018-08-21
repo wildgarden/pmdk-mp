@@ -82,7 +82,10 @@ int util_tmpfile(const char *dir, const char *templ);
 int util_is_absolute_path(const char *path);
 
 int util_file_create(const char *path, size_t size, size_t minsize);
+int util_file_create_unlocked(const char *path, size_t size, size_t minsize);
 int util_file_open(const char *path, size_t *size, size_t minsize, int flags);
+int util_file_open_unlocked(const char *path, size_t *size, size_t minsize,
+	int flags);
 int util_unlink(const char *path);
 int util_unlink_flock(const char *path);
 int util_file_mkdir(const char *path, mode_t mode);

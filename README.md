@@ -73,6 +73,7 @@ required packages on the build system:
 
 * **autoconf**
 * **pkg-config**
+* **libtool**
 
 
 On Windows, to build NVML and run the tests you need:

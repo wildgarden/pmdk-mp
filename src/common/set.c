@@ -910,7 +910,8 @@ static int
 util_parse_add_remote_replica(struct pool_set **setp, char *node_addr,
 				char *pool_desc)
 {
-	LOG(3, "setp %p node_addr %s pool_desc %s", setp, node_addr, pool_desc);
+	LOG(3, "setp %p node_addr %s rpool_desc %s", setp, node_addr,
+	    pool_desc);
 
 	ASSERTne(setp, NULL);
 	ASSERTne(node_addr, NULL);
@@ -1216,10 +1217,12 @@ util_poolset_single(const char *path, size_t filesize, int create)
 }
 
 /*
- * util_part_open -- open or create a single part file
+ * util_part_open_interal -- (internal) open or create a single part file
+ * Does all the heavy lifting
  */
-int
-util_part_open(struct pool_set_part *part, size_t minsize, int create)
+static int
+util_part_open_internal(struct pool_set_part *part, size_t minsize, int create,
+	int flock_pool)
 {
 	LOG(3, "part %p minsize %zu create %d", part, minsize, create);
 
@@ -1229,7 +1232,9 @@ util_part_open(struct pool_set_part *part, size_t minsize, int create)
 
 	part->created = 0;
 	if (create) {
-		part->fd = util_file_create(part->path, part->filesize,
+		part->fd = flock_pool
+			? util_file_create(part->path, part->filesize, minsize)
+			: util_file_create_unlocked(part->path, part->filesize,
 				minsize);
 		if (part->fd == -1) {
 			LOG(2, "failed to create file: %s", part->path);
@@ -1239,7 +1244,10 @@ util_part_open(struct pool_set_part *part, size_t minsize, int create)
 	} else {
 		size_t size = 0;
 		int flags = O_RDWR;
-		part->fd = util_file_open(part->path, &size, minsize, flags);
+		part->fd = flock_pool
+			? util_file_open(part->path, &size, minsize, flags)
+			: util_file_open_unlocked(part->path, &size, minsize,
+				flags);
 		if (part->fd == -1) {
 			LOG(2, "failed to open file: %s", part->path);
 			return -1;
@@ -1255,6 +1263,24 @@ util_part_open(struct pool_set_part *part, size_t minsize, int create)
 	}
 
 	return 0;
+}
+
+/*
+ * util_part_open -- open or create a single part file
+ */
+int
+util_part_open(struct pool_set_part *part, size_t minsize, int create)
+{
+	return util_part_open_internal(part, minsize, create, 1 /* flock */);
+}
+
+/*
+ * util_part_open -- open or create a single part file
+ */
+int
+util_part_open_unlocked(struct pool_set_part *part, size_t minsize, int create)
+{
+	return util_part_open_internal(part, minsize, create, 0);
 }
 
 /*
@@ -1461,16 +1487,22 @@ util_poolset_remote_open(struct pool_replica *rep, unsigned repidx,
  *                              part files of a pool set and replica sets
  */
 static int
-util_poolset_files_local(struct pool_set *set, size_t minsize, int create)
+util_poolset_files_local(struct pool_set *set, size_t minsize, int create,
+	int flock_pool)
 {
-	LOG(3, "set %p minsize %zu create %d", set, minsize, create);
+	LOG(3, "set %p minsize %zu create %d flock %i", set, minsize,
+		create, flock_pool);
 
 	for (unsigned r = 0; r < set->nreplicas; r++) {
 		struct pool_replica *rep = set->replica[r];
 		if (!rep->remote) {
 			for (unsigned p = 0; p < rep->nparts; p++) {
-				if (util_part_open(&rep->part[p], minsize,
-							create))
+				int err = flock_pool
+					? util_part_open(&rep->part[p],
+						minsize, create)
+					: util_part_open_unlocked(&rep->part[p],
+						minsize, create);
+				if (err)
 					return -1;
 			}
 		}
@@ -1572,14 +1604,15 @@ util_poolset_read(struct pool_set **setp, const char *path)
 }
 
 /*
- * util_poolset_create_set -- create a new pool set structure
+ * util_poolset_create_set_internal -- (internal) create a new pool
+ * set structure
  *
  * On success returns 0 and a pointer to a newly allocated structure
  * containing the info of all the parts of the pool set and replicas.
  */
-int
-util_poolset_create_set(struct pool_set **setp, const char *path,
-				size_t poolsize, size_t minsize)
+static int
+util_poolset_create_set_internal(struct pool_set **setp, const char *path,
+	size_t poolsize, size_t minsize, int flock)
 {
 	LOG(3, "setp %p path %s poolsize %zu minsize %zu",
 		setp, path, poolsize, minsize);
@@ -1603,8 +1636,12 @@ util_poolset_create_set(struct pool_set **setp, const char *path,
 		return 0;
 	}
 
+	fd = flock
+		? util_file_open(path, &size, 0, O_RDONLY)
+		: util_file_open_unlocked(path, &size, 0, O_RDONLY);
+
 	/* do not check minsize */
-	if ((fd = util_file_open(path, &size, 0, O_RDONLY)) == -1)
+	if (fd == -1)
 		return -1;
 
 	char signature[POOLSET_HDR_SIG_LEN];
@@ -1660,6 +1697,35 @@ err:
 	(void) os_close(fd);
 	errno = oerrno;
 	return ret;
+}
+
+/*
+ * util_poolset_create_set -- create a new pool set structure
+ *
+ * On success returns 0 and a pointer to a newly allocated structure
+ * containing the info of all the parts of the pool set and replicas.
+ */
+int
+util_poolset_create_set(struct pool_set **setp, const char *path,
+	size_t poolsize, size_t minsize)
+{
+	return util_poolset_create_set_internal(setp, path, poolsize, minsize,
+		1 /* flock*/);
+}
+
+/*
+ * util_poolset_create_set_unlocked -- create a new pool set
+ * structure (without locking)
+ *
+ * On success returns 0 and a pointer to a newly allocated structure
+ * containing the info of all the parts of the pool set and replicas.
+ */
+int
+util_poolset_create_set_unlocked(struct pool_set **setp, const char *path,
+	size_t poolsize, size_t minsize)
+{
+	return util_poolset_create_set_internal(setp, path, poolsize, minsize,
+		0 /* dont't lock*/);
 }
 
 /*
@@ -2268,7 +2334,8 @@ int
 util_pool_create_uuids(struct pool_set **setp, const char *path,
 	size_t poolsize, size_t minsize, const char *sig,
 	uint32_t major, uint32_t compat, uint32_t incompat, uint32_t ro_compat,
-	unsigned *nlanes, int can_have_rep, int remote, struct pool_attr *pattr)
+	unsigned *nlanes, int can_have_rep, int remote, struct pool_attr *pattr,
+	int flock_pool)
 {
 	LOG(3, "setp %p path %s poolsize %zu minsize %zu "
 		"sig %.8s major %u compat %#x incompat %#x ro_comapt %#x "
@@ -2290,7 +2357,10 @@ util_pool_create_uuids(struct pool_set **setp, const char *path,
 		return -1;
 	}
 
-	int ret = util_poolset_create_set(setp, path, poolsize, minsize);
+	int ret = flock_pool
+		? util_poolset_create_set(setp, path, poolsize, minsize)
+		: util_poolset_create_set_unlocked(setp, path, poolsize,
+			minsize);
 	if (ret < 0) {
 		LOG(2, "cannot create pool set -- '%s'", path);
 		return -1;
@@ -2356,7 +2426,7 @@ util_pool_create_uuids(struct pool_set **setp, const char *path,
 			POOL_HDR_UUID_LEN);
 	}
 
-	ret = util_poolset_files_local(set, minsize, 1);
+	ret = util_poolset_files_local(set, minsize, 1, flock_pool);
 	if (ret != 0)
 		goto err_poolset;
 
@@ -2440,17 +2510,18 @@ int
 util_pool_create(struct pool_set **setp, const char *path, size_t poolsize,
 	size_t minsize, const char *sig, uint32_t major, uint32_t compat,
 	uint32_t incompat, uint32_t ro_compat, unsigned *nlanes,
-	int can_have_rep)
+	int can_have_rep, int flock_pool)
 {
 	LOG(3, "setp %p path %s poolsize %zu minsize %zu "
 		"sig %.8s major %u compat %#x incompat %#x "
-		"ro_comapt %#x nlanes %p can_have_rep %i",
+		"ro_comapt %#x nlanes %p can_have_rep %i flock_pool %i",
 		setp, path, poolsize, minsize,
-		sig, major, compat, incompat, ro_compat, nlanes, can_have_rep);
+		sig, major, compat, incompat, ro_compat, nlanes, can_have_rep,
+		flock_pool);
 
 	return util_pool_create_uuids(setp, path, poolsize, minsize, sig, major,
-					compat, incompat, ro_compat, nlanes,
-					can_have_rep, POOL_LOCAL, NULL);
+	    compat, incompat, ro_compat, nlanes, can_have_rep, POOL_LOCAL,
+	    NULL, flock_pool);
 }
 
 /*
@@ -2772,7 +2843,7 @@ util_pool_open_nocheck(struct pool_set *set, int cow)
 		return -1;
 	}
 
-	int ret = util_poolset_files_local(set, 0, 0);
+	int ret = util_poolset_files_local(set, 0, 0, 1);
 	if (ret != 0)
 		goto err_poolset;
 
@@ -2808,26 +2879,30 @@ err_poolset:
 }
 
 /*
- * util_pool_open -- open a memory pool (set or a single file)
+ * util_pool_open_internal -- (internal) open a memory pool
+ * (set or a single file).
  *
  * This routine does all the work, but takes a rdonly flag so internal
  * calls can map a read-only pool if required.
  */
-int
-util_pool_open(struct pool_set **setp, const char *path, int cow,
-	size_t minsize, const char *sig,
-	uint32_t major, uint32_t compat, uint32_t incompat, uint32_t ro_compat,
-	unsigned *nlanes)
+static int
+util_pool_open_internal(struct pool_set **setp, const char *path, int cow,
+	size_t minsize, const char *sig, uint32_t major, uint32_t compat,
+	uint32_t incompat, uint32_t ro_compat, unsigned *nlanes,
+	int flock_pool)
 {
 	LOG(3, "setp %p path %s cow %d minsize %zu sig %.8s major %u "
-		"compat %#x incompat %#x ro_comapt %#x nlanes %p",
+		"compat %#x incompat %#x ro_comapt %#x nlanes %p flock_pool %d",
 		setp, path, cow, minsize, sig, major,
-		compat, incompat, ro_compat, nlanes);
+		compat, incompat, ro_compat, nlanes, flock_pool);
 
 	int flags = cow ? MAP_PRIVATE|MAP_NORESERVE : MAP_SHARED;
 	int oerrno;
 
-	int ret = util_poolset_create_set(setp, path, 0, minsize);
+	/* do not check minsize */
+	int ret = flock_pool
+		    ? util_poolset_create_set(setp, path, 0, minsize)
+		    : util_poolset_create_set_unlocked(setp, path, 0, minsize);
 	if (ret < 0) {
 		LOG(2, "cannot open pool set -- '%s'", path);
 		return -1;
@@ -2852,7 +2927,7 @@ util_pool_open(struct pool_set **setp, const char *path, int cow,
 		return -1;
 	}
 
-	ret = util_poolset_files_local(set, minsize, 0);
+	ret = util_poolset_files_local(set, minsize, 0, flock_pool);
 	if (ret != 0)
 		goto err_poolset;
 
@@ -2888,6 +2963,37 @@ err_poolset:
 	util_poolset_close(set, DO_NOT_DELETE_PARTS);
 	errno = oerrno;
 	return -1;
+}
+
+/*
+ * util_pool_open -- open a memory pool (set or a single file)
+ *
+ * This routine does all the work, but takes a rdonly flag so internal
+ * calls can map a read-only pool if required.
+ */
+int
+util_pool_open(struct pool_set **setp, const char *path, int cow,
+	size_t minsize, const char *sig, uint32_t major, uint32_t compat,
+	uint32_t incompat, uint32_t ro_compat, unsigned *nlanes)
+{
+	return util_pool_open_internal(setp, path, cow, minsize, sig,
+	major, compat, incompat, ro_compat, nlanes, 1 /* flock*/);
+}
+
+/*
+ * util_pool_open_unlocked -- open a memory pool (set or a single file) without
+ * locking it.
+ *
+ * This routine does all the work, but takes a rdonly flag so internal
+ * calls can map a read-only pool if required.
+ */
+int
+util_pool_open_unlocked(struct pool_set **setp, const char *path, int cow,
+	size_t minsize, const char *sig, uint32_t major, uint32_t compat,
+	uint32_t incompat, uint32_t ro_compat, unsigned *nlanes)
+{
+	return util_pool_open_internal(setp, path, cow, minsize, sig,
+		major, compat, incompat, ro_compat, nlanes, 0);
 }
 
 /*
@@ -2935,7 +3041,7 @@ util_pool_open_remote(struct pool_set **setp, const char *path, int cow,
 		goto err_poolset;
 	}
 
-	ret = util_poolset_files_local(set, minsize, 0);
+	ret = util_poolset_files_local(set, minsize, 0, 1 /* flock */);
 	if (ret != 0)
 		goto err_poolset;
 
@@ -3060,7 +3166,7 @@ util_poolset_foreach_part(const char *path,
 		if (set->replica[r]->remote) {
 			part.is_remote = 1;
 			part.node_addr = set->replica[r]->remote->node_addr;
-			part.pool_desc = set->replica[r]->remote->pool_desc;
+			part.rpool_desc = set->replica[r]->remote->pool_desc;
 			ret = cb(&part, arg);
 			if (ret)
 				goto out;

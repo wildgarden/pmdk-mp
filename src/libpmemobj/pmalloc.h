@@ -54,7 +54,7 @@ struct lane_alloc_layout {
 	struct redo_log redo[ALLOC_REDO_LOG_SIZE];
 };
 
-int pmalloc_operation(struct palloc_heap *heap,
+int pmalloc_operation(PMEMobjpool *pop,
 	uint64_t off, uint64_t *dest_off, size_t size,
 	palloc_constr constructor, void *arg,
 	uint64_t extra_field, uint16_t flags,
@@ -69,7 +69,7 @@ int pmalloc_construct(PMEMobjpool *pop, uint64_t *off, size_t size,
 int prealloc(PMEMobjpool *pop, uint64_t *off, size_t size,
 	uint64_t extra_field, uint16_t flags);
 
-void pfree(PMEMobjpool *pop, uint64_t *off);
+int pfree(PMEMobjpool *pop, uint64_t *off);
 
 struct redo_log *pmalloc_redo_hold(PMEMobjpool *pop);
 void pmalloc_redo_release(PMEMobjpool *pop);

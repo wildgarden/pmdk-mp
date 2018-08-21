@@ -98,6 +98,8 @@ extern __thread struct _pobj_pcache {
 	int invalidate;
 } _pobj_cached_pool;
 
+extern void* pmemobj_get_base_addr(void* pop);
+
 /*
  * Returns the direct pointer of an object.
  */
@@ -120,7 +122,7 @@ pmemobj_direct_inline(PMEMoid oid)
 		cache->uuid_lo = oid.pool_uuid_lo;
 	}
 
-	return (void *)((uintptr_t)cache->pop + oid.off);
+	return (void *)((uintptr_t)pmemobj_get_base_addr(cache->pop) + oid.off);
 }
 
 #endif /* _WIN32 */

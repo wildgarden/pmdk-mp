@@ -56,6 +56,7 @@ typedef void *(*worker)(void *);
 
 /* the mock pmemobj pool */
 static PMEMobjpool Mock_pop;
+static struct pool_descriptor Mock_pool_desc;
 
 /* the tested object containing persistent synchronization primitives */
 static struct mock_obj {
@@ -82,7 +83,7 @@ mock_open_pool(PMEMobjpool *pop)
 #ifdef _WIN32
 	__sync_fetch_and_add64(&pop->run_id, 2);
 #else
-	__sync_fetch_and_add(&pop->run_id, 2);
+	__sync_fetch_and_add(&pop->pool_desc->run_id, 2);
 #endif
 
 }
@@ -377,6 +378,7 @@ main(int argc, char *argv[])
 		= (os_thread_t *)MALLOC(num_threads * sizeof(os_thread_t));
 
 	/* first pool open */
+	Mock_pop.pool_desc = &Mock_pool_desc;
 	mock_open_pool(&Mock_pop);
 	Mock_pop.p_ops.persist = obj_sync_persist;
 	Mock_pop.p_ops.base = &Mock_pop;

@@ -118,5 +118,6 @@ EXPORTS
 	pmemobj_drain
 	pmemobj_direct
 	pmemobj_oid
+	pmemobj_get_base_addr
 	_pobj_debug_notice
 	DllMain

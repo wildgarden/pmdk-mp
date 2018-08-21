@@ -395,9 +395,10 @@ out_common(const char *file, int line, const char *func, int level,
 		char *f = strrchr(file, OS_DIR_SEPARATOR);
 		if (f)
 			file = f + 1;
+
 		ret = out_snprintf(&buf[cc], MAXPRINT - cc,
-				"<%s>: <%d> [%s:%d %s] ",
-				Log_prefix, level, file, line, func);
+				"[%ld] <%s>: <%d> [%s:%d %s] ",
+			(long)getpid(), Log_prefix, level, file, line, func);
 		if (ret < 0) {
 			Print("out_snprintf failed");
 			goto end;
@@ -472,8 +473,9 @@ out_error(const char *file, int line, const char *func,
 			if (f)
 				file = f + 1;
 			ret = out_snprintf(&buf[cc], MAXPRINT,
-					"<%s>: <1> [%s:%d %s] ",
-					Log_prefix, file, line, func);
+					"[%ld] <%s>: <1> [%s:%d %s] ",
+					(long)getpid(), Log_prefix, file, line,
+					func);
 			if (ret < 0) {
 				Print("out_snprintf failed");
 				goto end;

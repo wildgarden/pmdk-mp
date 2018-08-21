@@ -42,6 +42,7 @@ SOURCE =\
 	$(COMMON)/mmap_linux.c\
 	$(COMMON)/os_linux.c\
 	$(COMMON)/os_thread_linux.c\
+	$(COMMON)/os_shm.c\
 	$(COMMON)/out.c\
 	$(COMMON)/pool_hdr.c\
 	$(COMMON)/pool_hdr_linux.c\
@@ -62,6 +63,7 @@ SOURCE =\
 	lane.c\
 	libpmemobj.c\
 	list.c\
+	shm_list.c\
 	memblock.c\
 	memops.c\
 	obj.c\
@@ -70,6 +72,7 @@ SOURCE =\
 	pvector.c\
 	recycler.c\
 	redo.c\
+	registry.c\
 	ringbuf.c\
 	sync.c\
 	tx.c
@@ -79,3 +82,4 @@ include ../Makefile.inc
 CFLAGS += -DUSE_LIBDL -D_PMEMOBJ_INTRNL
 
 LIBS += -pthread -lpmem -ldl
+LIBS += -lrt

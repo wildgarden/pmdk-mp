@@ -48,8 +48,8 @@ require_test_type medium
 configure_valgrind pmemcheck force-disable
 
 setup
-
-create_nonzeroed_file 16M 8K $DIR/testfile1
+MIN_POOL_SIZE=$((8*1024*1024*16))
+create_nonzeroed_file $MIN_POOL_SIZE 8K $DIR/testfile1
 
 expect_normal_exit ./obj_tx_alloc$EXESUFFIX $DIR/testfile1
 

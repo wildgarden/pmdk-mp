@@ -387,7 +387,7 @@ pool_params_parse(const PMEMpoolcheck *ppc, struct pool_params *params,
 		params->blk.bsize = le32toh(pbp.bsize);
 	} else if (params->type == POOL_TYPE_OBJ) {
 		struct pmemobjpool *pop = addr;
-		memcpy(params->obj.layout, pop->layout,
+		memcpy(params->obj.layout, pop->pool_desc->layout,
 			PMEMOBJ_MAX_LAYOUT);
 	}
 

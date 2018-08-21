@@ -241,7 +241,7 @@ rm_poolset_cb(struct part_file *pf, void *arg)
 	int *error = (int *)arg;
 	int ret;
 	if (pf->is_remote) {
-		ret = remove_remote(pf->node_addr, pf->pool_desc);
+		ret = remove_remote(pf->node_addr, pf->rpool_desc);
 	} else {
 		const char *part_file = pf->path;
 

@@ -196,7 +196,7 @@ void
 ut_sighandler(int sig)
 {
 	UT_ERR("\n");
-	UT_ERR("Signal %d, backtrace:", sig);
+	UT_ERR("[%ld] Signal %d, backtrace:", (long)getpid(), sig);
 	ut_dump_backtrace();
 	UT_ERR("\n");
 	exit(128 + sig);

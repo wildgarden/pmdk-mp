@@ -1,0 +1,4 @@
+Unknown option: pmembench_malloc.cfg
+Usage: $ pmembench [-h|--help] [-v|--version]	[<benchmark>[<args>]]
+						[<config>[<scenario>]]
+						[<config>[<scenario>[<common_args>]]]

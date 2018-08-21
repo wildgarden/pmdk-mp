@@ -80,5 +80,5 @@ uint64_t redo_log_offset(const struct redo_log *redo);
 int redo_log_is_last(const struct redo_log *redo);
 
 const struct pmem_ops *redo_get_pmem_ops(const struct redo_ctx *ctx);
-
+void *redo_get_base_addr(const struct redo_ctx *ctx);
 #endif

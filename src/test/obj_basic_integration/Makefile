@@ -40,3 +40,5 @@ LIBPMEM=y
 LIBPMEMOBJ=y
 
 include ../Makefile.inc
+
+CFLAGS+= -lrt

@@ -61,6 +61,8 @@ static void *base_ptr;
 
 struct mock_pop {
 	PMEMobjpool p;
+	/* XXX mp-mode workaround to comply with old PMEMobjpool size */
+	char padding[OBJ_LANES_OFFSET - sizeof(PMEMobjpool)];
 	struct lane_layout l[MAX_MOCK_LANES];
 };
 
@@ -127,14 +129,38 @@ SECTION_PARM(LANE_SECTION_LIST, &noop_ops);
 SECTION_PARM(LANE_SECTION_TRANSACTION, &noop_ops);
 
 static void
+prepare_pool_desc(struct mock_pop *pop)
+{
+	pop->p.pool_desc = (void *)((uintptr_t)pop->p.base_addr +
+	    POOL_HDR_SIZE);
+	pop->p.pool_desc->nlanes = MAX_MOCK_LANES;
+	pop->p.pool_desc->lanes_offset = (uint64_t)&pop->l -
+	    (uint64_t)pop->p.base_addr;
+}
+
+static void
+prepare_lanes_desc(struct mock_pop *pop)
+{
+	pop->p.lanes_desc.runtime_nlanes = (unsigned)pop->p.pool_desc->nlanes;
+	pop->p.lanes_desc.lane = MALLOC(MAX_MOCK_LANES * sizeof(struct lane));
+	pop->p.lanes_desc.lane_locks = ZALLOC(MAX_MOCK_LANES *
+	    sizeof(uint64_t));
+}
+
+static void
 test_lane_boot_cleanup_ok(void)
 {
 	struct mock_pop *pop = MALLOC(sizeof(struct mock_pop));
-	pop->p.nlanes = MAX_MOCK_LANES;
-
 	base_ptr = &pop->p;
+	pop->p.base_addr = &pop->p;
 
-	pop->p.lanes_offset = (uint64_t)&pop->l - (uint64_t)&pop->p;
+	prepare_pool_desc(pop);
+	prepare_lanes_desc(pop);
+
+	struct lane_range *range = lane_range_new();
+	range->idx_start = 0;
+	range->idx_end = pop->p.lanes_desc.runtime_nlanes - 1;
+	pop->p.lane_range = range;
 
 	lane_info_boot();
 	UT_ASSERTeq(lane_boot(&pop->p), 0);
@@ -160,10 +186,16 @@ static void
 test_lane_boot_fail(void)
 {
 	struct mock_pop *pop = MALLOC(sizeof(struct mock_pop));
-	pop->p.nlanes = MAX_MOCK_LANES;
-
 	base_ptr = &pop->p;
-	pop->p.lanes_offset = (uint64_t)&pop->l - (uint64_t)&pop->p;
+	pop->p.base_addr = &pop->p;
+
+	prepare_pool_desc(pop);
+	prepare_lanes_desc(pop);
+
+	struct lane_range *range = lane_range_new();
+	range->idx_start = 0;
+	range->idx_end = pop->p.lanes_desc.runtime_nlanes - 1;
+	pop->p.lane_range = range;
 
 	construct_fail = 1;
 
@@ -174,6 +206,7 @@ test_lane_boot_fail(void)
 	UT_ASSERTeq(pop->p.lanes_desc.lane, NULL);
 	UT_ASSERTeq(pop->p.lanes_desc.lane_locks, NULL);
 
+	FREE(pop->p.lane_range);
 	FREE(pop);
 }
 
@@ -181,10 +214,11 @@ static void
 test_lane_recovery_check_ok(void)
 {
 	struct mock_pop *pop = MALLOC(sizeof(struct mock_pop));
-	pop->p.nlanes = MAX_MOCK_LANES;
-
 	base_ptr = &pop->p;
-	pop->p.lanes_offset = (uint64_t)&pop->l - (uint64_t)&pop->p;
+	pop->p.base_addr = &pop->p;
+
+	prepare_pool_desc(pop);
+	prepare_lanes_desc(pop);
 
 	UT_ASSERTeq(lane_recover_and_section_boot(&pop->p), 0);
 	UT_ASSERTeq(lane_check(&pop->p), 0);
@@ -196,10 +230,11 @@ static void
 test_lane_recovery_check_fail(void)
 {
 	struct mock_pop *pop = MALLOC(sizeof(struct mock_pop));
-	pop->p.nlanes = MAX_MOCK_LANES;
-
 	base_ptr = &pop->p;
-	pop->p.lanes_offset = (uint64_t)&pop->l - (uint64_t)&pop->p;
+	pop->p.base_addr = &pop->p;
+
+	prepare_pool_desc(pop);
+	prepare_lanes_desc(pop);
 
 	recovery_check_fail = 1;
 
@@ -232,15 +267,21 @@ test_lane_hold_release(void)
 	};
 
 	struct mock_pop *pop = MALLOC(sizeof(struct mock_pop));
-	pop->p.nlanes = 1;
+	base_ptr = &pop->p;
+	pop->p.base_addr = &pop->p;
+	prepare_pool_desc(pop);
+
 	pop->p.lanes_desc.runtime_nlanes = 1,
 	pop->p.lanes_desc.lane = &mock_lane;
 	pop->p.lanes_desc.next_lane_idx = 0;
 
 	pop->p.lanes_desc.lane_locks = CALLOC(OBJ_NLANES, sizeof(uint64_t));
-	pop->p.lanes_offset = (uint64_t)&pop->l - (uint64_t)&pop->p;
 	pop->p.uuid_lo = 123456;
-	base_ptr = &pop->p;
+
+	struct lane_range *range = lane_range_new();
+	range->idx_start = 0;
+	range->idx_end = pop->p.lanes_desc.runtime_nlanes - 1;
+	pop->p.lane_range = range;
 
 	struct lane_section *sec;
 	lane_hold(&pop->p, &sec, LANE_SECTION_ALLOCATOR);
@@ -264,6 +305,7 @@ test_lane_hold_release(void)
 
 	SIGACTION(SIGABRT, &old, NULL);
 
+	Free(pop->p.lane_range);
 	FREE(pop->p.lanes_desc.lane_locks);
 	FREE(pop);
 }
@@ -340,11 +382,16 @@ static void
 test_lane_cleanup_in_separate_thread(void)
 {
 	struct mock_pop *pop = MALLOC(sizeof(struct mock_pop));
-	pop->p.nlanes = MAX_MOCK_LANES;
-
 	base_ptr = &pop->p;
+	pop->p.base_addr = &pop->p;
 
-	pop->p.lanes_offset = (uint64_t)&pop->l - (uint64_t)&pop->p;
+	prepare_pool_desc(pop);
+	prepare_lanes_desc(pop);
+
+	struct lane_range *range = lane_range_new();
+	range->idx_start = 0;
+	range->idx_end = pop->p.lanes_desc.runtime_nlanes - 1;
+	pop->p.lane_range = range;
 
 	lane_info_boot();
 	UT_ASSERTeq(lane_boot(&pop->p), 0);

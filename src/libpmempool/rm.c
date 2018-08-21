@@ -141,7 +141,7 @@ rm_cb(struct part_file *pf, void *arg)
 	struct cb_args *args = (struct cb_args *)arg;
 	int ret;
 	if (pf->is_remote) {
-		ret = rm_remote(pf->node_addr, pf->pool_desc, args->flags);
+		ret = rm_remote(pf->node_addr, pf->rpool_desc, args->flags);
 	} else {
 		ret = rm_local(pf->path, args->flags, 1);
 	}

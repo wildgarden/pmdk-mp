@@ -47,11 +47,14 @@
 #include "redo.h"
 #include "list.h"
 
+#define SIZEOF_ZONE_REGION (64)
+#define MAX_ZONE_REGIONS (16)
 #define SIZEOF_CHUNK_HEADER_V3 (8)
 #define MAX_CHUNK_V3 (65535 - 7)
 #define SIZEOF_CHUNK_V3 (1024ULL * 256)
 #define SIZEOF_ZONE_HEADER_V3 (64)
 #define SIZEOF_ZONE_METADATA_V3 (SIZEOF_ZONE_HEADER_V3 +\
+	SIZEOF_ZONE_REGION * MAX_ZONE_REGIONS +\
 	SIZEOF_CHUNK_HEADER_V3 * MAX_CHUNK_V3)
 #define SIZEOF_HEAP_HDR_V3 (1024)
 #define SIZEOF_LEGACY_ALLOCATION_HEADER_V3 (64)
@@ -107,9 +110,20 @@ main(int argc, char *argv[])
 	UT_COMPILE_ERROR_ON(sizeof(struct chunk_header) !=
 		SIZEOF_CHUNK_HEADER_V3);
 
+	ASSERT_ALIGNED_BEGIN(struct zone_region);
+	ASSERT_ALIGNED_FIELD(struct zone_region, idx);
+	ASSERT_ALIGNED_FIELD(struct zone_region, offset);
+	ASSERT_ALIGNED_FIELD(struct zone_region, size);
+	ASSERT_ALIGNED_FIELD(struct zone_region, claimant);
+	ASSERT_ALIGNED_FIELD(struct zone_region, lock);
+	ASSERT_ALIGNED_CHECK(struct zone_region);
+	UT_COMPILE_ERROR_ON(sizeof(struct zone_region) !=
+			    SIZEOF_ZONE_REGION);
+
 	ASSERT_ALIGNED_BEGIN(struct zone_header);
 	ASSERT_ALIGNED_FIELD(struct zone_header, magic);
 	ASSERT_ALIGNED_FIELD(struct zone_header, size_idx);
+	ASSERT_ALIGNED_FIELD(struct zone_header, regions_in_use);
 	ASSERT_ALIGNED_FIELD(struct zone_header, reserved);
 	ASSERT_ALIGNED_CHECK(struct zone_header);
 	UT_COMPILE_ERROR_ON(sizeof(struct zone_header) !=
@@ -117,6 +131,7 @@ main(int argc, char *argv[])
 
 	ASSERT_ALIGNED_BEGIN(struct zone);
 	ASSERT_ALIGNED_FIELD(struct zone, header);
+	ASSERT_ALIGNED_FIELD(struct zone, regions);
 	ASSERT_ALIGNED_FIELD(struct zone, chunk_headers);
 	ASSERT_ALIGNED_CHECK(struct zone);
 	UT_COMPILE_ERROR_ON(sizeof(struct zone) !=

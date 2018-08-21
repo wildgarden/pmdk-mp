@@ -164,8 +164,9 @@ lane_info_cleanup(PMEMobjpool *pop)
 static struct lane_layout *
 lane_get_layout(PMEMobjpool *pop, uint64_t lane_idx)
 {
-	return (void *)((char *)pop + pop->lanes_offset +
-		sizeof(struct lane_layout) * lane_idx);
+	return (void *)((char *)pop->base_addr +
+	    pop->pool_desc->lanes_offset +
+	    sizeof(struct lane_layout) * lane_idx);
 }
 
 /*
@@ -201,7 +202,7 @@ error_section_construct:
 /*
  * lane_destroy -- cleanups a single lane runtime variables
  */
-static void
+void
 lane_destroy(PMEMobjpool *pop, struct lane *lane)
 {
 	for (int i = 0; i < MAX_LANE_SECTION; ++i)
@@ -215,29 +216,25 @@ int
 lane_boot(PMEMobjpool *pop)
 {
 	int err = 0;
-
-	pop->lanes_desc.lane = Malloc(sizeof(struct lane) * pop->nlanes);
 	if (pop->lanes_desc.lane == NULL) {
 		err = ENOMEM;
-		ERR("!Malloc of volatile lanes");
+		ERR("!(shm)malloc of lanes");
 		goto error_lanes_malloc;
 	}
 
-	pop->lanes_desc.next_lane_idx = 0;
-
-	pop->lanes_desc.lane_locks =
-		Zalloc(sizeof(*pop->lanes_desc.lane_locks) * pop->nlanes);
 	if (pop->lanes_desc.lane_locks == NULL) {
-		ERR("!Malloc for lane locks");
+		ERR("!(shm)malloc for lane locks");
 		goto error_locks_malloc;
 	}
-
 	/* add lanes to pmemcheck ignored list */
-	VALGRIND_ADD_TO_GLOBAL_TX_IGNORE((char *)pop + pop->lanes_offset,
-		(sizeof(struct lane_layout) * pop->nlanes));
+	VALGRIND_ADD_TO_GLOBAL_TX_IGNORE(
+		(char *)pop->base_addr + pop->pool_desc->lanes_offset,
+		(sizeof(struct lane_layout) * pop->pool_desc->nlanes));
 
 	uint64_t i;
-	for (i = 0; i < pop->nlanes; ++i) {
+	for (i = pop->lane_range->idx_start;
+	    i <= pop->lane_range->idx_end;
+	    ++i) {
 		struct lane_layout *layout = lane_get_layout(pop, i);
 
 		if ((err = lane_init(pop, &pop->lanes_desc.lane[i], layout))) {
@@ -249,14 +246,19 @@ lane_boot(PMEMobjpool *pop)
 	return 0;
 
 error_lane_init:
-	for (; i >= 1; --i)
+	for (; i >= pop->lane_range->idx_start + 1; --i)
 		lane_destroy(pop, &pop->lanes_desc.lane[i - 1]);
-	Free(pop->lanes_desc.lane_locks);
-	pop->lanes_desc.lane_locks = NULL;
+
 error_locks_malloc:
-	Free(pop->lanes_desc.lane);
-	pop->lanes_desc.lane = NULL;
+	if (pop->mp_mode == 0)
+		Free(pop->lanes_desc.lane_locks);
+	pop->lanes_desc.lane_locks = NULL;
+
 error_lanes_malloc:
+	if (pop->mp_mode == 0)
+		Free(pop->lanes_desc.lane);
+	pop->lanes_desc.lane = NULL;
+
 	return err;
 }
 
@@ -266,30 +268,58 @@ error_lanes_malloc:
 void
 lane_cleanup(PMEMobjpool *pop)
 {
-	for (uint64_t i = 0; i < pop->nlanes; ++i)
+	for (uint64_t i = pop->lane_range->idx_start;
+	    i <= pop->lane_range->idx_end;
+	    ++i)
 		lane_destroy(pop, &pop->lanes_desc.lane[i]);
 
-	Free(pop->lanes_desc.lane);
-	pop->lanes_desc.lane = NULL;
-	Free(pop->lanes_desc.lane_locks);
-	pop->lanes_desc.lane_locks = NULL;
+	if (pop->mp_mode == 0) {
+		Free(pop->lanes_desc.lane);
+		Free(pop->lanes_desc.lane_locks);
+		pop->lanes_desc.lane = NULL;
+		pop->lanes_desc.lane_locks = NULL;
+	}
+
+	Free(pop->lane_range);
 
 	lane_info_cleanup(pop);
 }
 
 /*
- * lane_recover_and_boot -- performs initialization and recovery of all lanes
+ * lane_section_boot -- performs initialization of all lanes
+ */
+int
+lane_section_boot(PMEMobjpool *pop)
+{
+	int err = 0;
+	int i; /* section index */
+
+	for (i = 0; i < MAX_LANE_SECTION; ++i) {
+		if ((err = Section_ops[i]->boot(pop)) != 0) {
+			LOG(2, "section_ops->init %d %d", i, err);
+			return err;
+		}
+	}
+
+	return err;
+}
+
+/*
+ * lane_recover_and_section_boot -- performs initialization and recovery of all
+ * lanes
  */
 int
 lane_recover_and_section_boot(PMEMobjpool *pop)
 {
+	LOG(3, "pop %p", pop);
+
 	int err = 0;
 	int i; /* section index */
 	uint64_t j; /* lane index */
 	struct lane_layout *layout;
 
 	for (i = 0; i < MAX_LANE_SECTION; ++i) {
-		for (j = 0; j < pop->nlanes; ++j) {
+		for (j = 0; j < pop->pool_desc->nlanes; ++j) {
 			layout = lane_get_layout(pop, j);
 			err = Section_ops[i]->recover(pop, &layout->sections[i],
 				sizeof(layout->sections[i]));
@@ -311,6 +341,56 @@ lane_recover_and_section_boot(PMEMobjpool *pop)
 }
 
 /*
+ * lane_recover -- performs recovery for given range of lanes
+ */
+int
+lane_recover(PMEMobjpool *pop, struct lane_range *lrange)
+{
+	LOG(3, "pop %p, other proc lane_idx_start %i, lane_idx_end: %i",
+		    pop, lrange->idx_start, lrange->idx_end);
+
+	/*
+	 * XXX mp-mode -- not locked while recovering
+	 * because protection by region lock is enough. This might change
+	 * once dynamic lane assignment is implemented.
+	 */
+	int err = 0;
+	int i; /* section index */
+	uint64_t j; /* lane index */
+	struct lane_layout *layout;
+
+	/* initialize */
+	uint64_t l_idx;
+	for (l_idx = lrange->idx_start; l_idx <= lrange->idx_end; ++l_idx) {
+		layout = lane_get_layout(pop, l_idx);
+
+		if ((err =
+		    lane_init(pop, &pop->lanes_desc.lane[l_idx], layout))) {
+			ERR("!lane_init");
+			return err;
+		}
+	}
+
+	/* recover all sections */
+	for (i = 0; i < MAX_LANE_SECTION; ++i) {
+		for (j = lrange->idx_start; j <= lrange->idx_end; ++j) {
+			layout = lane_get_layout(pop, j);
+			err = Section_ops[i]->recover(pop, &layout->sections[i],
+				sizeof(layout->sections[i]));
+			if (err != 0) {
+				LOG(2, "section_ops->recover %d %" PRIu64 " %d",
+					i, j, err);
+				return err;
+			}
+			/* release locks */
+			pop->lanes_desc.lane_locks[j] = 0;
+		}
+	}
+
+	return err;
+}
+
+/*
  * lane_check -- performs check of all lanes
  */
 int
@@ -322,7 +402,7 @@ lane_check(PMEMobjpool *pop)
 	struct lane_layout *layout;
 
 	for (i = 0; i < MAX_LANE_SECTION; ++i) {
-		for (j = 0; j < pop->nlanes; ++j) {
+		for (j = 0; j < pop->pool_desc->nlanes; ++j) {
 			layout = lane_get_layout(pop, j);
 			err = Section_ops[i]->check(pop, &layout->sections[i],
 					sizeof(layout->sections[i]));
@@ -343,12 +423,16 @@ lane_check(PMEMobjpool *pop)
  * get_lane -- (internal) get free lane index
  */
 static inline void
-get_lane(uint64_t *locks, struct lane_info *info, uint64_t nlocks)
+get_lane(uint64_t *locks, struct lane_info *info, struct lane_range *range,
+    uint64_t nlanes)
 {
+	uint64_t nlocks = (range->idx_end - range->idx_start) + 1;
+	nlocks = MIN(nlocks, nlanes);
 	info->lane_idx = info->primary;
 	while (1) {
 		do {
-			info->lane_idx %= nlocks;
+			info->lane_idx = range->idx_start +
+			    (info->lane_idx % nlocks);
 			if (likely(util_bool_compare_and_swap64(
 					&locks[info->lane_idx], 0, 1))) {
 				if (info->lane_idx == info->primary) {
@@ -359,6 +443,10 @@ get_lane(uint64_t *locks, struct lane_info *info, uint64_t nlocks)
 					info->primary_attempts =
 						LANE_PRIMARY_ATTEMPTS;
 				}
+
+				LOG(5, "acquired lane number %" PRIu64,
+				    info->lane_idx);
+
 				return;
 			}
 
@@ -368,7 +456,7 @@ get_lane(uint64_t *locks, struct lane_info *info, uint64_t nlocks)
 			}
 
 			++info->lane_idx;
-		} while (info->lane_idx < nlocks);
+		} while (info->lane_idx <= range->idx_end);
 
 		sched_yield();
 	}
@@ -437,20 +525,34 @@ lane_hold(PMEMobjpool *pop, struct lane_section **section,
 		ASSERT(pop->has_remote_replicas);
 		if (section != NULL)
 			FATAL("cannot obtain section before lane's init");
+		/*
+		 * XXX mp-mode
+		 * needs proper handling in mp-mode
+		 */
 		return RLANE_DEFAULT;
 	}
 
 	struct lane_info *lane = get_lane_info_record(pop);
 	while (unlikely(lane->lane_idx == UINT64_MAX)) {
-		/* initial wrap to next CL */
+		/*
+		 * initial wrap to next CL
+		 *
+		 *  Notes for mp-mode:
+		 *  - next_lane_idx was initialized with
+		 *    'lane_range->start' in obj_assign_lane_range_new()
+		 *  - assigning a lane idx > lane_range->end is no problem,
+		 *    since that case is handled in get_lane()
+		 */
 		lane->primary = lane->lane_idx = __sync_fetch_and_add(
 			&pop->lanes_desc.next_lane_idx, LANE_JUMP);
 	} /* handles wraparound */
 
 	uint64_t *llocks = pop->lanes_desc.lane_locks;
+
 	/* grab next free lane from lanes available at runtime */
 	if (!lane->nest_count++) {
-		get_lane(llocks, lane, pop->lanes_desc.runtime_nlanes);
+		get_lane(llocks, lane, pop->lane_range,
+		    pop->lanes_desc.runtime_nlanes);
 	}
 
 	if (section) {
@@ -516,4 +618,28 @@ lane_release(PMEMobjpool *pop)
 			FATAL("util_bool_compare_and_swap64");
 		}
 	}
+}
+
+/*
+ * lane_range_new --  deallocates the given lane_range
+ */
+void
+lane_range_delete(struct lane_range *r)
+{
+	ASSERTne(r, NULL);
+	Free(r);
+}
+
+/*
+ * lane_range_new -- allocates new lane_range
+ */
+struct lane_range *
+lane_range_new()
+{
+	struct lane_range *r = Malloc(sizeof(struct lane_range));
+	if (unlikely(r == NULL)) {
+		FATAL("Malloc");
+	}
+
+	return r;
 }

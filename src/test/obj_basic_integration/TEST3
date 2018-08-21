@@ -41,7 +41,9 @@ require_test_type medium
 
 setup
 
-create_poolset $DIR/testset1 16M:$DIR/testfile1:x r 16M:$DIR/testfile2:x
+DOUBLE_MIN_POOL_SIZE=$((8*1024*1024*16*2))
+
+create_poolset $DIR/testset1 $DOUBLE_MIN_POOL_SIZE:$DIR/testfile1:x r $DOUBLE_MIN_POOL_SIZE:$DIR/testfile2:x
 
 expect_normal_exit\
     ./obj_basic_integration$EXESUFFIX $DIR/testset1

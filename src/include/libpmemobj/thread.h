@@ -90,8 +90,24 @@ int pmemobj_cond_signal(PMEMobjpool *pop, PMEMcond *condp);
 int pmemobj_cond_timedwait(PMEMobjpool *pop, PMEMcond *__restrict condp,
 	PMEMmutex *__restrict mutexp,
 	const struct timespec *__restrict abs_timeout);
+
 int pmemobj_cond_wait(PMEMobjpool *pop, PMEMcond *condp,
 	PMEMmutex *__restrict mutexp);
+
+/* multi-processing support */
+int pmemobj_mutex_lock_mp(PMEMobjpool *pop, PMEMmutex *mutexp);
+int pmemobj_mutex_unlock_mp(PMEMobjpool *pop, PMEMmutex *mutexp);
+int pmemobj_mutex_timedlock_mp(PMEMobjpool *pop, PMEMmutex *__restrict mutexp,
+	const struct timespec *__restrict abs_timeout);
+int pmemobj_cond_signal_mp(PMEMobjpool *pop, PMEMcond *condp);
+int pmemobj_cond_broadcast_mp(PMEMobjpool *pop, PMEMcond *condp);
+int pmemobj_cond_timedwait_mp(PMEMobjpool *pop, PMEMcond *__restrict condp,
+	PMEMmutex *__restrict mutexp,
+	const struct timespec *__restrict abs_timeout);
+int pmemobj_cond_wait_mp(PMEMobjpool *pop, PMEMcond *condp,
+	PMEMmutex *__restrict mutexp);
+
+int pmemobj_mutex_consistent(PMEMobjpool *pop, PMEMmutex *mutexp);
 
 #ifdef __cplusplus
 }

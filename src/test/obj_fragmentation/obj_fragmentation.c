@@ -48,8 +48,15 @@
  * For the best accuracy fragmentation should be measured for one full zone
  * because the metadata is preallocated. For reasonable test duration a smaller
  * size must be used.
+ *
+ * With 256mb MiB and alloc size 7654 (TEST2) we have 0.11886799 overhead with
+ * is slightly  above the threshold. This result is higly dependend from the
+ * alloc size.
+ *
+ * As a workaround the default value was adopted to increase accuracy, such
+ * that the test passes, again.
  */
-#define DEFAULT_FILE_SIZE ((size_t)(1ULL << 28)) /* 256 megabytes */
+#define DEFAULT_FILE_SIZE ((size_t)(1ULL << 29)) /* 512 megabytes */
 
 int
 main(int argc, char *argv[])

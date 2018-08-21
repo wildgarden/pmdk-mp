@@ -430,10 +430,11 @@ util_file_pread(const char *path, void *buffer, size_t size,
 }
 
 /*
- * util_file_create -- create a new memory pool file
+ * util_file_create_internal -- create a new memory pool file
  */
-int
-util_file_create(const char *path, size_t size, size_t minsize)
+static int
+util_file_create_internal(const char *path, size_t size, size_t minsize,
+    int flock)
 {
 	LOG(3, "path \"%s\" size %zu minsize %zu", path, size, minsize);
 
@@ -475,10 +476,12 @@ util_file_create(const char *path, size_t size, size_t minsize)
 		goto err;
 	}
 
-	/* for windows we can't flock until after we fallocate */
-	if (os_flock(fd, OS_LOCK_EX | OS_LOCK_NB) < 0) {
-		ERR("!flock \"%s\"", path);
-		goto err;
+	if (flock) {
+		/* for windows we can't flock until after we fallocate */
+		if (os_flock(fd, OS_LOCK_EX | OS_LOCK_NB) < 0) {
+			ERR("!flock \"%s\"", path);
+			goto err;
+		}
 	}
 
 	return fd;
@@ -493,14 +496,35 @@ err:
 	return -1;
 }
 
+
 /*
- * util_file_open -- open a memory pool file
+ * util_file_create -- create a new memory pool file, that is not locked
  */
 int
-util_file_open(const char *path, size_t *size, size_t minsize, int flags)
+util_file_create_unlocked(const char *path, size_t size, size_t minsize)
 {
-	LOG(3, "path \"%s\" size %p minsize %zu flags %d", path, size, minsize,
-			flags);
+	return util_file_create_internal(path, size, minsize, 0);
+}
+
+/*
+ * util_file_create -- create a new memory pool file
+ */
+int
+util_file_create(const char *path, size_t size, size_t minsize)
+{
+	return util_file_create_internal(path, size, minsize, 1);
+}
+
+/*
+ * util_file_open_internal --  (internal) open a memory pool file. Does all
+ * the heavy lifting
+ */
+static int
+util_file_open_internal(const char *path, size_t *size, size_t minsize,
+    int flags, int flock)
+{
+	LOG(3, "path \"%s\" size %p minsize %zu flags %d flock %i", path, size,
+	    minsize, flags, flock);
 
 	int oerrno;
 	int fd;
@@ -514,10 +538,12 @@ util_file_open(const char *path, size_t *size, size_t minsize, int flags)
 		return -1;
 	}
 
-	if (os_flock(fd, OS_LOCK_EX | OS_LOCK_NB) < 0) {
-		ERR("!flock \"%s\"", path);
-		(void) os_close(fd);
-		return -1;
+	if (flock) {
+		if (os_flock(fd, OS_LOCK_EX | OS_LOCK_NB) < 0) {
+			ERR("!flock \"%s\"", path);
+			(void) os_close(fd);
+			return -1;
+		}
 	}
 
 	if (size || minsize) {
@@ -552,6 +578,25 @@ err:
 	(void) os_close(fd);
 	errno = oerrno;
 	return -1;
+}
+
+/*
+ * util_file_open -- open a memory pool file
+ */
+int
+util_file_open(const char *path, size_t *size, size_t minsize, int flags)
+{
+	return util_file_open_internal(path, size, minsize, flags, 1);
+}
+
+/*
+ * util_file_open_unlocked -- open a memory pool file without locking it
+ */
+int
+util_file_open_unlocked(const char *path, size_t *size, size_t minsize,
+	int flags)
+{
+	return util_file_open_internal(path, size, minsize, flags, 0);
 }
 
 /*

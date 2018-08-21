@@ -41,12 +41,20 @@
 #include <sys/types.h>
 
 #include <libpmemobj/base.h>
+#include <libpmemobj/mp_base.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define PMEMOBJ_MIN_POOL ((size_t)(1024 * 1024 * 8)) /* 8 MB */
+/* 8 MiB  per process (arbitrary chosen) */
+#define PMEMOBJ_MIN_POOL ((size_t)(1024 * 1024 * 8 * MAX_PROCS))
+
+/*
+ * This limit is set arbitrary to incorporate a pool header and required
+ * alignment plus supply.
+ */
+#define PMEMOBJ_MIN_PART ((size_t)(1024 * 1024 * 2)) /* 2 MiB */
 
 /*
  * Pool management.

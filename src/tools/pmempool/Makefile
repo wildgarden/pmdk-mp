@@ -82,4 +82,5 @@ BASH_COMP_FILES = pmempool.sh
 
 include ../Makefile.inc
 
+LIBS += -lrt
 .PHONY: test check

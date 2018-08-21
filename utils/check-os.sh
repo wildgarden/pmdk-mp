@@ -36,7 +36,7 @@
 #
 # usage: ./check-os.sh [os.h path] [.o file] [.c file]
 
-EXCLUDE="os_linux|os_thread_linux"
+EXCLUDE="os_linux|os_thread_linux|os_shm"
 if [[ $2 =~ $EXCLUDE ]]; then
 	echo "skip $2"
 	exit 0

@@ -123,12 +123,14 @@ pmemobj_open_mock(const char *fname, size_t redo_size)
 
 	UT_ASSERT(size >= PMEMOBJ_POOL_HDR_SIZE + redo_size);
 
-	PMEMobjpool *pop = (PMEMobjpool *)addr;
-	VALGRIND_REMOVE_PMEM_MAPPING((char *)addr + sizeof(pop->hdr), 4096);
+	PMEMobjpool *pop = Zalloc(sizeof(*pop));
 	pop->addr = addr;
+	pop->base_addr = addr;
+	VALGRIND_REMOVE_PMEM_MAPPING((char *)addr + sizeof(pop->hdr), 4096);
 	pop->size = size;
 	pop->is_pmem = is_pmem;
 	pop->rdonly = 0;
+	pop->lock_fd = -1;
 
 	if (pop->is_pmem) {
 		pop->persist_local = pmem_persist;
@@ -145,10 +147,16 @@ pmemobj_open_mock(const char *fname, size_t redo_size)
 	pop->p_ops.drain = obj_drain;
 	pop->p_ops.base = pop;
 
-	pop->heap_offset = PMEMOBJ_POOL_HDR_SIZE + redo_size;
-	pop->heap_size = pop->size - pop->heap_offset;
+	pop->pool_desc = (struct pool_descriptor *)((uintptr_t)pop->base_addr
+		+ POOL_HDR_SIZE);
 
-	pop->redo = redo_log_config_new(pop->addr, &pop->p_ops,
+	/* create the persistent part of pool's descriptor */
+	memset(pop->pool_desc, 0, OBJ_DSC_P_SIZE);
+
+	pop->pool_desc->heap_offset = PMEMOBJ_POOL_HDR_SIZE + redo_size;
+	pop->pool_desc->heap_size = pop->size - pop->pool_desc->heap_offset;
+
+	pop->redo = redo_log_config_new(pop->base_addr, &pop->p_ops,
 			redo_log_check_offset, pop, REDO_NUM_ENTRIES);
 
 	return pop;
@@ -159,7 +167,7 @@ pmemobj_close_mock(PMEMobjpool *pop)
 {
 	redo_log_config_delete(pop->redo);
 
-	UT_ASSERTeq(pmem_unmap(pop, pop->size), 0);
+	UT_ASSERTeq(pmem_unmap(pop->base_addr, pop->size), 0);
 }
 
 int

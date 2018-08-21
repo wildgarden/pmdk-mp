@@ -585,6 +585,13 @@ function get_trace() {
 	if [ "$check_type" = "memcheck" -a "$MEMCHECK_DONT_CHECK_LEAKS" != "1" ]; then
 		opts="$opts --leak-check=full"
 	fi
+
+    # When enabled, Valgrind will trace into sub-processes initiated via the exec system call.
+    # This is necessary for multi-process programs.
+    if [ "$VALGRIND_TRACE_CHILDREN" == "1" ]; then
+        opts="$opts --trace-children=yes"
+    fi
+
 	opts="$opts --suppressions=../ld.supp --suppressions=../memcheck-libunwind.supp"
 	if [ "$node" -ne -1 ]; then
 		exe=${NODE_VALGRINDEXE[$node]}

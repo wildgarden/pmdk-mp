@@ -134,7 +134,7 @@ struct mutex_bench {
 
 #define GET_VOLATILE_MUTEX(pop, mutexp)                                        \
 	(os_mutex_t *)get_lock(                                                \
-		(pop)->run_id, &(mutexp)->volatile_pmemmutex.runid,            \
+		(pop)->pool_desc->run_id, &(mutexp)->volatile_pmemmutex.runid,            \
 		(mutexp)->volatile_pmemmutex.mutexp,                           \
 		(int (*)(void **lock, void *arg))volatile_mutex_init)
 
@@ -445,7 +445,7 @@ op_bench_mutex(struct mutex_bench *mb)
 						 mb, mb->pop);
 		}
 		if (mb->pa->run_id_increment)
-			mb->pop->run_id += 2; /* must be a multiple of 2 */
+			mb->pop->pool_desc->run_id += 2; /* must be a multiple of 2 */
 	} else {
 		if (mb->lock_mode == OP_MODE_1BY1) {
 			bench_operation_1by1(os_mutex_lock_wrapper,
@@ -537,7 +537,7 @@ op_bench_rwlock(struct mutex_bench *mb)
 				pmemobj_rwlock_unlock_wrapper, mb, mb->pop);
 		}
 		if (mb->pa->run_id_increment)
-			mb->pop->run_id += 2; /* must be a multiple of 2 */
+			mb->pop->pool_desc->run_id += 2; /* must be a multiple of 2 */
 	} else {
 		if (mb->lock_mode == OP_MODE_1BY1) {
 			bench_operation_1by1(
@@ -613,7 +613,7 @@ op_bench_vmutex(struct mutex_bench *mb)
 	}
 
 	if (mb->pa->run_id_increment)
-		mb->pop->run_id += 2; /* must be a multiple of 2 */
+		mb->pop->pool_desc->run_id += 2; /* must be a multiple of 2 */
 
 	return 0;
 }

@@ -110,7 +110,7 @@ main(int argc, char *argv[])
 	oids[0] = OID_NULL;
 
 	for (int i = 0; i < npools; ++i) {
-		uint64_t off = pops[i]->heap_offset;
+		uint64_t off = pops[i]->pool_desc->heap_offset;
 		oids[i] = (PMEMoid) {pops[i]->uuid_lo, off};
 		UT_ASSERT(OID_EQUALS(oids[i],
 			pmemobj_oid(pmemobj_direct(oids[i]))));

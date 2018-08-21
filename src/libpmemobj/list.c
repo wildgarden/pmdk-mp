@@ -112,7 +112,7 @@ list_mutexes_lock(PMEMobjpool *pop,
 	ASSERTne(head1, NULL);
 
 	if (!head2 || head1 == head2)
-		return pmemobj_mutex_lock(pop, &head1->lock);
+		return pop->pmem_lock(pop, &head1->lock);
 
 	PMEMmutex *lock1;
 	PMEMmutex *lock2;
@@ -125,15 +125,15 @@ list_mutexes_lock(PMEMobjpool *pop,
 	}
 
 	int ret;
-	if ((ret = pmemobj_mutex_lock(pop, lock1)))
+	if ((ret = pop->pmem_lock(pop, lock1)))
 		goto err;
-	if ((ret = pmemobj_mutex_lock(pop, lock2)))
+	if ((ret = pop->pmem_lock(pop, lock2)))
 		goto err_unlock;
 
 	return 0;
 
 err_unlock:
-	pmemobj_mutex_unlock(pop, lock1);
+	pop->pmem_unlock(pop, lock1);
 err:
 	return ret;
 }
@@ -614,7 +614,7 @@ list_insert_new_user(PMEMobjpool *pop,
 	size_t usable_size, void *arg), void *arg, PMEMoid *oidp)
 {
 	int ret;
-	if ((ret = pmemobj_mutex_lock(pop, &user_head->lock))) {
+	if ((ret = pop->pmem_lock(pop, &user_head->lock))) {
 		errno = ret;
 		LOG(2, "pmemobj_mutex_lock failed");
 		return -1;
@@ -654,7 +654,7 @@ list_insert(PMEMobjpool *pop,
 
 	lane_hold(pop, &lane_section, LANE_SECTION_LIST);
 
-	if ((ret = pmemobj_mutex_lock(pop, &head->lock))) {
+	if ((ret = pop->pmem_lock(pop, &head->lock))) {
 		errno = ret;
 		LOG(2, "pmemobj_mutex_lock failed");
 		ret = -1;
@@ -804,7 +804,7 @@ list_remove_free_user(PMEMobjpool *pop, size_t pe_offset,
 	LOG(3, NULL);
 
 	int ret;
-	if ((ret = pmemobj_mutex_lock(pop, &user_head->lock))) {
+	if ((ret = pop->pmem_lock(pop, &user_head->lock))) {
 		errno = ret;
 		LOG(2, "pmemobj_mutex_lock failed");
 		return -1;
@@ -842,7 +842,7 @@ list_remove(PMEMobjpool *pop,
 	ASSERTne(lane_section, NULL);
 	ASSERTne(lane_section->layout, NULL);
 
-	if ((ret = pmemobj_mutex_lock(pop, &head->lock))) {
+	if ((ret = pop->pmem_lock(pop, &head->lock))) {
 		errno = ret;
 		LOG(2, "pmemobj_mutex_lock failed");
 		ret = -1;
@@ -1039,7 +1039,7 @@ err:
 static int
 lane_list_recovery(PMEMobjpool *pop, void *data, unsigned length)
 {
-	LOG(3, "list lane %p", data);
+	LOG(7, "list lane %p", data);
 
 	struct lane_list_layout *section = data;
 	ASSERT(sizeof(*section) <= length);

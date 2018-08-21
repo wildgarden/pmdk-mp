@@ -75,6 +75,7 @@ SRC=pmembench.cpp\
     pmemobj_gen.cpp\
     pmemobj_persist.cpp\
     obj_pmalloc.cpp\
+    malloc.cpp\
     obj_locks.cpp\
     obj_lanes.cpp\
     map_bench.cpp\
@@ -110,6 +111,7 @@ else
 LIBS += ../debug/libpmemcommon.a
 endif
 LIBS += -lpmemobj -lpmemlog -lpmemblk -lpmem -lvmem -pthread -lm -ldl
+LIBS += -lrt
 ifeq ($(call check_librt), n)
 LIBS += -lrt
 endif
@@ -133,6 +135,11 @@ ifeq ($(COVERAGE),1)
 CXXFLAGS += $(GCOV_CFLAGS)
 LDFLAGS += $(GCOV_LDFLAGS)
 LIBS += $(GCOV_LIBS)
+endif
+
+ifneq ($(SANITIZE),)
+CXXFLAGS += -fsanitize=$(SANITIZE)
+LDFLAGS += -fsanitize=$(SANITIZE)
 endif
 
 ifeq ($(BUILD_RPMEM),y)

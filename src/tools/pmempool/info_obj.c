@@ -468,12 +468,12 @@ info_obj_lanes(struct pmem_info *pip)
 	 * Iterate through all lanes from specified range and print
 	 * specified sections.
 	 */
-	struct lane_layout *lanes = (void *)((char *)pip->obj.pop +
-			pop->lanes_offset);
+	struct lane_layout *lanes = (void *)((char *)pip->obj.pop->base_addr +
+			pop->pool_desc->lanes_offset);
 	struct range *curp = NULL;
 	FOREACH_RANGE(curp, &pip->args.obj.lane_ranges) {
 		for (uint64_t i = curp->first;
-			i <= curp->last && i < pop->nlanes; i++) {
+			i <= curp->last && i < pop->pool_desc->nlanes; i++) {
 
 			/* For -R check print lane only if needs recovery */
 			if (pip->args.obj.lanes_recovery &&
@@ -504,12 +504,13 @@ info_obj_heap(struct pmem_info *pip)
 {
 	int v = pip->args.obj.vheap;
 	struct pmemobjpool *pop = pip->obj.pop;
-	struct heap_layout *layout = OFF_TO_PTR(pop, pop->heap_offset);
+	struct heap_layout *layout = OFF_TO_PTR(pop,
+	    pop->pool_desc->heap_offset);
 	struct heap_header *heap = &layout->header;
 
 	outv(v, "\nPMEMOBJ Heap Header:\n");
 	outv_hexdump(v && pip->args.vhdrdump, heap, sizeof(*heap),
-			pop->heap_offset, 1);
+			pop->pool_desc->heap_offset, 1);
 
 	outv_field(v, "Signature", "%s", heap->signature);
 	outv_field(v, "Major", "%ld", heap->major);
@@ -601,7 +602,7 @@ info_obj_run_bitmap(int v, struct chunk_run *run, uint32_t bsize)
 static int
 info_obj_memblock_is_root(struct pmem_info *pip, const struct memory_block *m)
 {
-	uint64_t roff = pip->obj.pop->root_offset;
+	uint64_t roff = pip->obj.pop->pool_desc->root_offset;
 	if (roff == 0)
 		return 0;
 
@@ -754,19 +755,19 @@ info_obj_root_obj(struct pmem_info *pip)
 	int v = pip->args.obj.vroot;
 
 	struct pmemobjpool *pop = pip->obj.pop;
-	if (!pop->root_offset) {
+	if (!pop->pool_desc->root_offset) {
 		outv(v, "\nNo root object...\n");
 		return;
 	}
 
 	outv_title(v, "Root object");
-	outv_field(v, "Offset", "0x%016zx", pop->root_offset);
-	uint64_t root_size = pop->root_size;
+	outv_field(v, "Offset", "0x%016zx", pop->pool_desc->root_offset);
+	uint64_t root_size = pop->pool_desc->root_size;
 	outv_field(v, "Size", "%s",
 			out_get_size_str(root_size, pip->args.human));
 
 	struct memory_block m = memblock_from_offset(
-			pip->obj.heap, pop->root_offset);
+			pip->obj.heap, pop->pool_desc->root_offset);
 
 	/* do not print object id and offset for root object */
 	info_obj_object_hdr(pip, v, VERBOSE_SILENT, &m, 0);
@@ -784,8 +785,9 @@ info_obj_zones_chunks(struct pmem_info *pip)
 		return;
 
 	struct pmemobjpool *pop = pip->obj.pop;
-	struct heap_layout *layout = OFF_TO_PTR(pop, pop->heap_offset);
-	size_t maxzone = util_heap_max_zone(pop->heap_size);
+	struct heap_layout *layout = OFF_TO_PTR(pop,
+	    pop->pool_desc->heap_offset);
+	size_t maxzone = util_heap_max_zone(pop->pool_desc->heap_size);
 	pip->obj.stats.n_zones = maxzone;
 	pip->obj.stats.zone_stats = calloc(maxzone,
 			sizeof(struct pmem_obj_zone_stats));
@@ -831,30 +833,30 @@ info_obj_descriptor(struct pmem_info *pip)
 	outv(v, "\nPMEM OBJ Header:\n");
 	struct pmemobjpool *pop = pip->obj.pop;
 
-	uint8_t *hdrptr = (uint8_t *)pop + sizeof(pop->hdr);
+	uint8_t *hdrptr = (uint8_t *)pop->base_addr + sizeof(pop->hdr);
 	size_t hdrsize = sizeof(*pop) - sizeof(pop->hdr);
 	size_t hdroff = sizeof(pop->hdr);
 	outv_hexdump(pip->args.vhdrdump, hdrptr, hdrsize, hdroff, 1);
 
 	/* check if layout is zeroed */
-	char *layout = util_check_memory((uint8_t *)pop->layout,
-			sizeof(pop->layout), 0) ?
-			pop->layout : "(null)";
+	char *layout = util_check_memory((uint8_t *)pop->pool_desc->layout,
+			sizeof(pop->pool_desc->layout), 0) ?
+			pop->pool_desc->layout : "(null)";
 
 	/* address for checksum */
 	void *dscp = (void *)((uintptr_t)(pop) + sizeof(struct pool_hdr));
 
 	outv_field(v, "Layout", "%s", layout);
-	outv_field(v, "Lanes offset", "0x%lx", pop->lanes_offset);
-	outv_field(v, "Number of lanes", "%lu", pop->nlanes);
-	outv_field(v, "Heap offset", "0x%lx", pop->heap_offset);
-	outv_field(v, "Heap size", "%lu", pop->heap_size);
+	outv_field(v, "Lanes offset", "0x%lx", pop->pool_desc->lanes_offset);
+	outv_field(v, "Number of lanes", "%lu", pop->pool_desc->nlanes);
+	outv_field(v, "Heap offset", "0x%lx", pop->pool_desc->heap_offset);
+	outv_field(v, "Heap size", "%lu", pop->pool_desc->heap_size);
 	outv_field(v, "Checksum", "%s", out_get_checksum(dscp, OBJ_DSC_P_SIZE,
-				&pop->checksum));
-	outv_field(v, "Root offset", "0x%lx", pop->root_offset);
+				&pop->pool_desc->checksum));
+	outv_field(v, "Root offset", "0x%lx", pop->pool_desc->root_offset);
 
 	/* run id with -v option */
-	outv_field(v + 1, "Run id", "%lu", pop->run_id);
+	outv_field(v + 1, "Run id", "%lu", pop->pool_desc->run_id);
 }
 
 /*
@@ -1140,7 +1142,8 @@ pmempool_info_obj(struct pmem_info *pip)
 	if (heap == NULL)
 		err(1, "Cannot allocate memory for heap data");
 
-	heap->layout = OFF_TO_PTR(pip->obj.pop, pip->obj.pop->heap_offset);
+	heap->layout = OFF_TO_PTR(pip->obj.pop,
+	    pip->obj.pop->pool_desc->heap_offset);
 	heap->base = pip->obj.pop;
 	pip->obj.alloc_classes = alloc_class_collection_new();
 	pip->obj.heap = heap;

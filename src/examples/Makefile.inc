@@ -45,8 +45,13 @@ include $(TOP)/src/common.inc
 CXXFLAGS = -std=c++11 -ggdb -Wall -Werror $(EXTRA_CXXFLAGS)
 CFLAGS = -std=gnu99 -ggdb -Wall -Werror -Wmissing-prototypes $(EXTRA_CFLAGS)
 LDFLAGS = -Wl,-rpath=$(LIBDIR) -L$(LIBDIR) $(EXTRA_LDFLAGS)
+ifneq ($(SANITIZE),)
+CFLAGS += -fsanitize=$(SANITIZE)
+CXXFLAGS += -fsanitize=$(SANITIZE)
+LDFLAGS += -fsanitize=$(SANITIZE)
+endif
 INCS = -I$(INCDIR) -I. -I$(TOP_SRC)/examples
-
+LIBS += -lrt
 LINKER=$(CC)
 ifeq ($(COMPILE_LANG), cpp)
 LINKER=$(CXX)

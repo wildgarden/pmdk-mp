@@ -200,7 +200,7 @@ memblock_header_legacy_write(const struct memory_block *m,
 	hdr->size = size;
 	hdr->type_num = extra;
 	hdr->root_size = ((uint64_t)flags << ALLOC_HDR_SIZE_SHIFT);
-	m->heap->p_ops.persist(m->heap->base, hdr, sizeof(*hdr));
+	m->heap->p_ops.persist(m->heap->pop, hdr, sizeof(*hdr));
 	VALGRIND_REMOVE_FROM_TX(hdr, sizeof(*hdr));
 
 	/* unused fields of the legacy headers are used as a red zone */
@@ -222,7 +222,7 @@ memblock_header_compact_write(const struct memory_block *m,
 	VALGRIND_ADD_TO_TX(hdr, sizeof(*hdr));
 	hdr->size = size | ((uint64_t)flags << ALLOC_HDR_SIZE_SHIFT);
 	hdr->extra = extra;
-	m->heap->p_ops.persist(m->heap->base, hdr, sizeof(*hdr));
+	m->heap->p_ops.persist(m->heap->pop, hdr, sizeof(*hdr));
 	VALGRIND_REMOVE_FROM_TX(hdr, sizeof(*hdr));
 }
 
@@ -491,10 +491,24 @@ run_prep_operation_hdr(const struct memory_block *m, enum memblock_state op,
  * huge_get_lock -- because huge memory blocks are always allocated from a
  *	single bucket there's no reason to lock them - the bucket itself is
  *	protected.
+ *
+ *	In multiprocessing mode we can't simply lock the other process bucket,
+ *	since we don't know who is the other process. But we know the region
+ *	to which the memory block belongs.
+ *	Since the single (default) bucket always allocates
+ *	from its active region, which is locked when the single bucket is
+ *	acquired, we can serialize the access to that region.
+ *
+ *      Other processes region transistion do not affect us.
  */
 static os_mutex_t *
 huge_get_lock(const struct memory_block *m)
 {
+
+	if (m->heap->mp_mode && heap_memblock_from_act_region(m) == 0) {
+		return &heap_get_region_by_chunk_id(m->heap, m)->lock;
+	}
+
 	return NULL;
 }
 
@@ -526,7 +540,7 @@ huge_get_state(const struct memory_block *m)
 }
 
 /*
- * huge_get_state -- returns whether a block from a run is allocated or not
+ * run_get_state -- returns whether a block from a run is allocated or not
  */
 static enum memblock_state
 run_get_state(const struct memory_block *m)
@@ -715,8 +729,8 @@ static enum memory_block_type
 memblock_detect_type(const struct memory_block *m, struct heap_layout *h)
 {
 	enum memory_block_type ret;
-
-	switch (ZID_TO_ZONE(h, m->zone_id)->chunk_headers[m->chunk_id].type) {
+	struct zone *z = ZID_TO_ZONE(h, m->zone_id);
+	switch (z->chunk_headers[m->chunk_id].type) {
 		case CHUNK_TYPE_RUN:
 		case CHUNK_TYPE_RUN_DATA:
 			ret = MEMORY_BLOCK_RUN;

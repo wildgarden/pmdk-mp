@@ -53,7 +53,8 @@ setup
 # exits in the middle of transaction, so pool cannot be closed
 export MEMCHECK_DONT_CHECK_LEAKS=1
 
-create_holey_file 16M $DIR/testfile
+MIN_POOL_SIZE=$((8*1024*1024*16))
+create_holey_file $MIN_POOL_SIZE $DIR/testfile
 
 expect_normal_exit ./obj_recovery$EXESUFFIX $DIR/testfile y c s
 expect_normal_exit ./obj_recovery$EXESUFFIX $DIR/testfile y o s

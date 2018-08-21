@@ -65,16 +65,16 @@
  * - long double
  * - void *
  *
- * The alignment of each type is computer as an offset of field
- * of specific type in the following structure:
+ * The alignment of each type is computed as an offset of the field
+ * of the specific type in the following structure:
  * struct {
  *	char byte;
  *	type field;
  * };
  *
  * The value is decremented by 1 and masked by 4 bits.
- * Multiple alignment are stored on consecutive 4 bits of each
- * type in order specified above.
+ * Multiple alignments are stored on consecutive 4 bits of each
+ * type in the order specified above.
  */
 struct arch_flags {
 	uint64_t alignment_desc;	/* alignment descriptor */

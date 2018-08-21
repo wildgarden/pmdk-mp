@@ -352,12 +352,13 @@ replica_check_store_size(struct pool_set *set,
 
 	void *dscp = (void *)((uintptr_t)&pop + sizeof(pop.hdr));
 
-	if (!util_checksum(dscp, OBJ_DSC_P_SIZE, &pop.checksum, 0)) {
+	if (!util_checksum(dscp, OBJ_DSC_P_SIZE, &pop.pool_desc->checksum, 0)) {
 		set_hs->replica[repn]->flags |= IS_BROKEN;
 		return 0;
 	}
 
-	set_hs->replica[repn]->pool_size = pop.heap_offset + pop.heap_size;
+	set_hs->replica[repn]->pool_size = pop.pool_desc->heap_offset +
+	    pop.pool_desc->heap_size;
 
 	return 0;
 }
@@ -943,7 +944,7 @@ replica_get_pool_size(struct pool_set *set, unsigned repn)
 	}
 
 	PMEMobjpool *pop = (PMEMobjpool *)part->addr;
-	size_t ret = pop->heap_offset + pop->heap_size;
+	size_t ret = pop->pool_desc->heap_offset + pop->pool_desc->heap_size;
 
 	if (should_unmap_part)
 		util_unmap_part(part);

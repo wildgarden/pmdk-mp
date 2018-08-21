@@ -42,6 +42,10 @@ LIBRARY_VERSION = 0.0
 SOURCE = $(COMMON)/util.c\
 	$(COMMON)/os_linux.c\
 	$(COMMON)/os_thread_linux.c\
+	$(COMMON)/file_linux.c\
+	$(COMMON)/mmap_linux.c\
+	$(COMMON)/mmap.c\
+	$(COMMON)/os_shm.c\
 	$(COMMON)/util_linux.c\
 	$(COMMON)/out.c\
 	librpmem.c\

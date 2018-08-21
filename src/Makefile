@@ -165,7 +165,7 @@ jemalloc-check: jemalloc-test
 test: all jemalloc-test
 	$(MAKE) -C test test
 
-check pcheck: test jemalloc-check
+check pcheck check-obj_mp: test jemalloc-check
 	$(MAKE) -C test $@
 
 check-remote: test

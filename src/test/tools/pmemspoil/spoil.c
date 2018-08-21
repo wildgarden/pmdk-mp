@@ -52,6 +52,7 @@
 #include <assert.h>
 #include <endian.h>
 #include <libpmem.h>
+#include <obj.h>
 #include "common.h"
 #include "output.h"
 #include "btt.h"
@@ -746,6 +747,47 @@ pmemspoil_process_pool_hdr(struct pmemspoil *psp,
 	return PROCESS_RET;
 }
 
+
+/*
+ * pmemspoil_process_pool_desc -- process pool_desc fields
+ */
+static int
+pmemspoil_process_pool_desc(struct pmemspoil *psp, struct pmemspoil_list *pfp,
+    void *arg)
+{
+	struct pool_descriptor pool_desc;
+	if (pmemspoil_read(psp, &pool_desc, POOL_DESC_SIZE, POOL_HDR_SIZE))
+		return -1;
+
+	PROCESS_BEGIN(psp, pfp) {
+	struct checksum_args checksum_args = {
+		.ptr = &pool_desc,
+		.len = OBJ_DSC_P_SIZE,
+		.checksum = &pool_desc.checksum,
+	};
+	PROCESS_FIELD(&pool_desc, layout, char);
+	PROCESS_FIELD(&pool_desc, lanes_offset, uint64_t);
+	PROCESS_FIELD(&pool_desc, nlanes, uint64_t);
+	PROCESS_FIELD(&pool_desc, heap_offset, uint64_t);
+	PROCESS_FIELD(&pool_desc, heap_size, uint64_t);
+	PROCESS_FIELD(&pool_desc, unused, char);
+	PROCESS_FIELD(&pool_desc, checksum, uint64_t);
+	PROCESS_FIELD(&pool_desc, run_id, uint64_t);
+
+	PROCESS_FIELD(&pool_desc, root_size, uint64_t);
+
+	PROCESS_FUNC("checksum_gen", checksum_gen, checksum_args);
+	} PROCESS_END
+
+	if (PROCESS_STATE == PROCESS_STATE_FIELD ||
+		PROCESS_STATE == PROCESS_STATE_FUNC) {
+	if (pmemspoil_write(psp, &pool_desc, POOL_DESC_SIZE, POOL_HDR_SIZE))
+		return -1;
+	}
+
+	return PROCESS_RET;
+}
+
 /*
  * pmemspoil_process_btt_info_struct -- process btt_info at given offset
  */
@@ -1095,7 +1137,8 @@ pmemspoil_process_zone(struct pmemspoil *psp, struct pmemspoil_list *pfp,
 		};
 
 		PROCESS_FIELD(zhdr, magic, uint32_t);
-		PROCESS_FIELD(zhdr, size_idx, uint32_t);
+		PROCESS_FIELD(zhdr, size_idx, uint16_t);
+		PROCESS_FIELD(zhdr, regions_in_use, uint16_t);
 		PROCESS_FIELD(zhdr, reserved, char);
 
 		PROCESS(chunk, cpair, zhdr->size_idx, struct chunk_pair);
@@ -1245,30 +1288,22 @@ static int
 pmemspoil_process_pmemobj(struct pmemspoil *psp,
 		struct pmemspoil_list *pfp, void *arg)
 {
-	struct pmemobjpool *pop = psp->addr;
-	struct heap_layout *hlayout = (void *)((char *)pop + pop->heap_offset);
-	struct lane_layout *lanes = (void *)((char *)pop + pop->lanes_offset);
+	struct pmemobjpool *pop = malloc(sizeof(struct pmemobjpool));
+	if (!pop)
+		err(1, NULL);
+
+	pop->base_addr = psp->addr;
+	pop->pool_desc = (struct pool_descriptor *)((uintptr_t)pop->base_addr
+	    + POOL_HDR_SIZE);
+
+	struct heap_layout *hlayout = (void *)((char *)pop->base_addr +
+	    pop->pool_desc->heap_offset);
+	struct lane_layout *lanes = (void *)((char *)pop->base_addr +
+	    pop->pool_desc->lanes_offset);
 
 	PROCESS_BEGIN(psp, pfp) {
-		struct checksum_args checksum_args = {
-			.ptr = pop,
-			.len = OBJ_DSC_P_SIZE,
-			.checksum = &pop->checksum,
-		};
-
-		PROCESS_FIELD(pop, layout, char);
-		PROCESS_FIELD(pop, lanes_offset, uint64_t);
-		PROCESS_FIELD(pop, nlanes, uint64_t);
-		PROCESS_FIELD(pop, heap_offset, uint64_t);
-		PROCESS_FIELD(pop, heap_size, uint64_t);
-		PROCESS_FIELD(pop, unused, char);
-		PROCESS_FIELD(pop, checksum, uint64_t);
-		PROCESS_FIELD(pop, run_id, uint64_t);
-
-		PROCESS_FUNC("checksum_gen", checksum_gen, checksum_args);
-
 		PROCESS(heap, hlayout, 1, struct heap_layout *);
-		PROCESS(lane, &lanes[PROCESS_INDEX], pop->nlanes,
+		PROCESS(lane, &lanes[PROCESS_INDEX], pop->pool_desc->nlanes,
 			struct lane_layout *);
 	} PROCESS_END
 
@@ -1284,6 +1319,7 @@ pmemspoil_process(struct pmemspoil *psp,
 {
 	PROCESS_BEGIN(psp, pfp) {
 		PROCESS(pool_hdr, NULL, 1, void *);
+		PROCESS(pool_desc, NULL, 1, void *);
 		PROCESS(pmemlog, NULL, 1, void *);
 		PROCESS(pmemblk, NULL, 1, void *);
 		PROCESS(pmemobj, NULL, 1, void *);

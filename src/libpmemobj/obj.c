@@ -53,6 +53,10 @@
 #include "set.h"
 #include "sync.h"
 #include "tx.h"
+#include "registry.h"
+#include <sched.h>
+#include <os_shm.h>
+#include <sys_util.h>
 
 /*
  * The variable from which the config is directly loaded. The contained string
@@ -70,7 +74,23 @@
  */
 #define OBJ_NLANES_ENV_VARIABLE "PMEMOBJ_NLANES"
 
+/*
+ * The variable which determines whether the pool is opened in
+ * multiprocessing mode.
+ */
+#define OBJ_MULTIPROCESS_ENV_VARIABLE "PMEMOBJ_MULTIPROCESS"
+
+/*
+ * The variable which determines whether the pool recovery is run
+ * automatically by the process which detected that another process crashed
+ * while holding a lock.
+ */
+#define OBJ_MULTIPROCESS_ROBUSTNESS_ENV_VARIABLE "PMEMOBJ_MULTIPROCESS_ROBUST"
+
+#define OBJ_SHM_MAGIC 0xCAFEBABE
+
 static struct cuckoo *pools_ht; /* hash table used for searching by UUID */
+static struct cuckoo *pools_trans_ht; /* maps pool base to transient addr */
 static struct ctree *pools_tree; /* tree used for searching by address */
 
 int _pobj_cache_invalidate;
@@ -150,10 +170,16 @@ pmemobj_direct(PMEMoid oid)
 		pcache->uuid_lo = oid.pool_uuid_lo;
 	}
 
-	return (void *)((uintptr_t)pcache->pop + oid.off);
+	return (void *)((uintptr_t)pcache->pop->base_addr + oid.off);
 }
 
 #endif /* _WIN32 */
+
+void *
+pmemobj_get_base_addr(void *pop)
+{
+	return ((PMEMobjpool *)pop)->base_addr;
+}
 
 /*
  * obj_ctl_init_and_load -- (static) initializes CTL and loads configuration
@@ -215,6 +241,10 @@ obj_pool_init(void)
 	if (pools_ht == NULL)
 		FATAL("!cuckoo_new");
 
+	pools_trans_ht = cuckoo_new();
+	if (pools_trans_ht == NULL)
+		FATAL("!cucko_new");
+
 	pools_tree = ctree_new();
 	if (pools_tree == NULL)
 		FATAL("!ctree_new");
@@ -232,7 +262,8 @@ pmemobj_oid(const void *addr)
 	if (pop == NULL)
 		return OID_NULL;
 
-	PMEMoid oid = {pop->uuid_lo, (uintptr_t)addr - (uintptr_t)pop};
+	PMEMoid oid = {pop->uuid_lo, (uintptr_t)addr -
+		    (uintptr_t)pop->base_addr};
 	return oid;
 }
 
@@ -252,9 +283,8 @@ obj_init(void)
 {
 	LOG(3, NULL);
 
-	COMPILE_ERROR_ON(sizeof(struct pmemobjpool) !=
-		POOL_HDR_SIZE + POOL_DESC_SIZE);
-
+	COMPILE_ERROR_ON(sizeof(struct pool_descriptor) !=
+		POOL_DESC_SIZE);
 #ifdef USE_COW_ENV
 	char *env = os_getenv("PMEMOBJ_COW");
 	if (env)
@@ -278,22 +308,102 @@ obj_init(void)
 	util_remote_init();
 }
 
+static void
+obj_env_cleanup(PMEMobjpool *pop)
+{
+	LOG(3, "pop %p", pop);
+
+	/*
+	 * "man pthread_mutex_destroy" states:
+	 * ["It  shall  be  safe  to  destroy  an  initialized  mutex
+	 * that is unlocked.  Attempting to destroy a locked mutex or a
+	 * mutex that is referenced (for example, while being used in a
+	 * pthread_cond_timedwait() or pthread_cond_wait()) by another
+	 * thread results in undefined behavior."]
+	 *
+	 * Another thread (of a crashed process) might still hold the
+	 * lock. So we try to fix it before unlocking.
+	 *
+	 * We reach this point only when we are the last process. Therefore
+	 * we handle only the crash scenario and expect the lock to be unlocked
+	 * otherwise.
+	 */
+	int err = os_mutex_trylock(&pop->shrd->lock);
+	switch (err) {
+		case EOWNERDEAD:
+			if (os_mutex_consistent(&pop->shrd->lock)) {
+				ERR("!os_mutex_consistent");
+			}
+			LOG(3, "Detected crashed process. Shuting down anyway");
+			/* no break */
+		case 0:
+			util_mutex_unlock(&pop->shrd->lock);
+			break;
+		case EBUSY:
+			ERR("Unlocked lock detected. ");
+		default:
+			ERR("Unexpected lock error during shutdown. "
+			    "Destroying the lock anyway. "
+			    "Undefined behaviour might happen. "
+			    "pop %p", pop);
+
+	}
+	/* try unlock mutex */
+	util_mutex_destroy(&pop->shrd->lock);
+	util_cond_destroy(&pop->shrd->cond);
+}
+
 /*
- * obj_fini -- cleanup of obj
- *
- * Called by destructor.
+ * obj_shm_cleanup -- (internal) cleanup the shared memory mappings
  */
 void
-obj_fini(void)
+obj_shm_cleanup(PMEMobjpool *pop, int clean_shrd)
 {
-	LOG(3, NULL);
+	LOG(3, "pop %p", pop);
 
-	if (pools_ht)
-		cuckoo_delete(pools_ht);
-	if (pools_tree)
-		ctree_delete(pools_tree);
-	lane_info_destroy();
-	util_remote_fini();
+	ASSERTne(pop->shrd, NULL);
+	ASSERTne(pop->shrd->area_size, 0);
+	ASSERTne(pop->shm_path, NULL);
+
+	if (clean_shrd) {
+		obj_env_cleanup(pop);
+
+		if (OBJ_SHM_USE_POSIX)
+			os_shm_unlink(pop->shm_path);
+		else
+			os_unlink(pop->shm_path);
+	}
+
+	/*
+	 * XXX mp-mode -- (shm) [critical] Implement testcase to illustrate and
+	 * further investigate. The parents memory region is unmapped, too
+	 *
+	 * For unknown reasons unmapping the shared memory during shutdown
+	 * (exit(0)) in the child process while it is holding a mutex causes
+	 * the parent to crash when accessing the mutex.
+	 */
+	/* (void) util_unmap(pop->shrd, pop->shrd->area_size); */
+	pop->shrd = NULL;
+}
+
+/*
+ * obj_pool_find_opened -- (internal) returns any opened pool by descending addr
+ */
+static PMEMobjpool *
+obj_pool_find_opened(void)
+{
+	/* XXX this is a temporary fix, to be fixed properly later */
+	if (pools_tree == NULL)
+		return NULL;
+
+	uint64_t key = (uint64_t)UINT64_MAX;
+	size_t pool_size = ctree_find_le_unlocked(pools_tree, &key);
+	ctree_remove_unlocked(pools_tree, key, 1);
+
+	if (pool_size == 0)
+		return NULL;
+
+	return cuckoo_get(pools_trans_ht, key);
 }
 
 /*
@@ -429,6 +539,8 @@ obj_norep_drain(void *ctx)
 
 static void obj_pool_cleanup(PMEMobjpool *pop);
 
+static int obj_open_mp_files(PMEMobjpool *pop);
+
 /*
  * obj_handle_remote_persist_error -- (internal) handle remote persist
  *                                    fatal error
@@ -463,7 +575,9 @@ obj_rep_memcpy_persist(void *ctx, void *dest, const void *src,
 
 	PMEMobjpool *rep = pop->replica;
 	while (rep) {
-		void *rdest = (char *)rep + (uintptr_t)dest - (uintptr_t)pop;
+		void *rdest = (char *)rep->base_addr + (uintptr_t)dest -
+		    (uintptr_t)pop->base_addr;
+		ASSERT(OBJ_PTR_FROM_POOL(rep, rdest));
 		if (rep->rpp == NULL) {
 			rep->memcpy_persist_local(rdest, src, len);
 		} else {
@@ -497,7 +611,9 @@ obj_rep_memset_persist(void *ctx, void *dest, int c, size_t len)
 
 	PMEMobjpool *rep = pop->replica;
 	while (rep) {
-		void *rdest = (char *)rep + (uintptr_t)dest - (uintptr_t)pop;
+		void *rdest = (char *)rep->base_addr + (uintptr_t)dest -
+		    (uintptr_t)pop->base_addr;
+		ASSERT(OBJ_PTR_FROM_POOL(rep, rdest));
 		if (rep->rpp == NULL) {
 			rep->memset_persist_local(rdest, c, len);
 		} else {
@@ -531,7 +647,9 @@ obj_rep_persist(void *ctx, const void *addr, size_t len)
 
 	PMEMobjpool *rep = pop->replica;
 	while (rep) {
-		void *raddr = (char *)rep + (uintptr_t)addr - (uintptr_t)pop;
+		void *raddr = (char *)rep->base_addr + (uintptr_t)addr -
+		    (uintptr_t)pop->base_addr;
+		ASSERT(OBJ_PTR_FROM_POOL(rep, raddr));
 		if (rep->rpp == NULL) {
 			rep->memcpy_persist_local(raddr, addr, len);
 		} else {
@@ -563,7 +681,9 @@ obj_rep_flush(void *ctx, const void *addr, size_t len)
 
 	PMEMobjpool *rep = pop->replica;
 	while (rep) {
-		void *raddr = (char *)rep + (uintptr_t)addr - (uintptr_t)pop;
+		void *raddr = (char *)rep->base_addr + (uintptr_t)addr -
+		    (uintptr_t)pop->base_addr;
+		ASSERT(OBJ_PTR_FROM_POOL(rep, raddr));
 		if (rep->rpp == NULL) {
 			memcpy(raddr, addr, len);
 			rep->flush_local(raddr, len);
@@ -713,12 +833,161 @@ obj_vg_boot(struct pmemobjpool *pop)
 #endif
 
 /*
- * obj_boot -- (internal) boots the pmemobj pool
+ * obj_assign_lane_range_new -- (internal) assign lanes process exclusive lanes
+ */
+static struct lane_range *
+obj_assign_lane_range_new(PMEMobjpool *pop)
+{
+	LOG(7, "pop %p", pop);
+
+	struct lane_range *range = lane_range_new();
+
+	if (pop->mp_mode) {
+		registry_get_lanes_by_idx(pop->registry, range, pop->proc_idx);
+	} else {
+		range->idx_start = 0;
+		range->idx_end = pop->lanes_desc.runtime_nlanes - 1;
+	}
+
+	if (pop->lane_range != NULL)
+		lane_range_delete(pop->lane_range);
+
+	pop->lanes_desc.next_lane_idx = range->idx_start;
+
+	return range;
+}
+
+enum error_state {
+    OK,
+    RETRY,
+    RECOVER,
+    PANIC,
+    MAX_ERROR_ACTION
+};
+
+/*
+ * obj_check_mutex_error -- (internal) translates an errno error code to a
+ * internal result code
  */
 static int
-obj_boot(PMEMobjpool *pop)
+obj_check_mutex_error(PMEMobjpool *pop, int err)
 {
-	LOG(3, "pop %p", pop);
+	switch (err) {
+		case 0:
+			break;
+		case EOWNERDEAD:
+			util_mutex_consistent(&pop->shrd->lock);
+			util_mutex_unlock(&pop->shrd->lock);
+			return RECOVER;
+		case EAGAIN:
+			ERR("EAGAIN shared heap lock");
+			return RETRY;
+		case EBUSY:
+			ERR("EBUSY already locked");
+			return RETRY;
+		case ETIMEDOUT:
+			ERR("ETIMEDOUT");
+			return RETRY;
+		case ENOTRECOVERABLE:
+			ERR("ENOTRECOVERABLE shared heap lock");
+			return RECOVER;
+		default:
+			ASSERT(0);
+	}
+
+	return OK;
+}
+
+/*
+ * obj_change_shared_state -- (internal) helper to change the shared state
+ */
+static inline int
+obj_change_shared_state(PMEMobjpool *pop,
+	volatile enum initialization_state state)
+{
+	LOG(3, "pop %pop state transition from %d -> %d", pop,
+		pop->shrd->state, state);
+	ASSERT(state > pop->shrd->state);
+
+	struct timespec ts;
+	int rc = obj_check_mutex_error(pop,
+		os_mutex_timedlock(&pop->shrd->lock, mp_set_mtx_timeout(&ts)));
+	if (rc)
+		return rc;
+
+	pop->shrd->state = state;
+	util_cond_broadcast(&pop->shrd->cond);
+	util_mutex_unlock(&pop->shrd->lock);
+
+	return 0;
+}
+
+/*
+ * obj_wait_until_state -- (internal) convenience wrapper for os_cond_timewait
+ */
+static int
+obj_wait_until_state(PMEMobjpool *pop, enum initialization_state state)
+{
+	LOG(3, "pop %p current: state %d, waiting for target state >= %d",
+	    pop, pop->shrd->state, state);
+
+	struct timespec ts;
+	int err = os_mutex_timedlock(&pop->shrd->lock, mp_set_mtx_timeout(&ts));
+	int ret = obj_check_mutex_error(pop, err);
+	if (ret)
+		return ret;
+
+	err = 0;
+	while (pop->shrd->state < state && err == 0) {
+		err = os_cond_timedwait(&pop->shrd->cond,
+			&pop->shrd->lock, &ts);
+		if (err == EOWNERDEAD) {
+			/*
+			 * Another process died. Whether it was during
+			 * initialzation or another secondary process remains
+			 * unclear.
+			 * There is noting we can do here,
+			 * we just retry until the timeout is reached.
+			 */
+			util_mutex_consistent(&pop->shrd->lock);
+			LOG(3, "os_cond_timedwait returned EOWNERDEAD");
+			err = 0;
+		}
+	}
+
+	/* pthread_cond_wait returns locked, even in error case */
+	util_mutex_unlock(&pop->shrd->lock);
+
+	if (pop->shrd->state >= state) {
+		/*
+		 * We are optimistic and continue as long as the predicate
+		 * is true.
+		 */
+		return 0;
+	}
+
+	return obj_check_mutex_error(pop, err);
+}
+
+/*
+ * obj_recover -- (internal) recovery for all lanes
+ */
+static int
+obj_recover(PMEMobjpool *pop)
+{
+	LOG(7, "pop %p", pop);
+	/*
+	 * Run recovery for all lanes
+	 */
+	pop->lane_range = Malloc(sizeof(struct lane_range));
+	pop->lane_range->idx_start = 0;
+	pop->lane_range->idx_end = pop->lanes_desc.runtime_nlanes - 1;
+
+	if (pop->mp_mode && (errno = obj_change_shared_state(pop,
+		RECOVERY_RUNNING)) != 0) {
+		ERR("!obj_change_shared_state");
+		return errno;
+	}
 
 	if ((errno = lane_boot(pop)) != 0) {
 		ERR("!lane_boot");
@@ -730,9 +999,243 @@ obj_boot(PMEMobjpool *pop)
 		return errno;
 	}
 
-	pop->conversion_flags = 0;
-	pmemops_persist(&pop->p_ops,
-		&pop->conversion_flags, sizeof(pop->conversion_flags));
+	/* we immediately destroy the resources */
+	for (uint64_t i = pop->lane_range->idx_start;
+	    i <= pop->lane_range->idx_end; ++i)
+		lane_destroy(pop, &pop->lanes_desc.lane[i]);
+
+	return 0;
+}
+
+/*
+ * obj_has_multiprocess_support -- determine if the pool supports multiple
+ * processes concurrently. The value is 1 (true) when supported, otherwise 0.
+ */
+static unsigned
+obj_has_multiprocess_support(void)
+{
+	unsigned ret = 0;
+	char *env = os_getenv(OBJ_MULTIPROCESS_ENV_VARIABLE);
+	if (env) {
+		if (strlen(env) > 1 || (env[0] != '0' && env[0] != '1')) {
+			ERR("%s variable must be either 0 (false) or 1 (true)",
+				OBJ_MULTIPROCESS_ENV_VARIABLE);
+			errno = EINVAL;
+			goto no_valid_env;
+		}
+
+		ret = (unsigned)atoi(env);
+	}
+
+	no_valid_env:
+	LOG(3, ":%s ", ret ? "true" : "false");
+	return ret;
+}
+
+/*
+ * obj_has_multiprocess_robustness -- determines whether the pool recovery
+ * is run automatically by the process which detected that another process
+ * crashed while holding a lock. The value is 1 (true) when supported,
+ * otherwise 0. Defaults to true.
+ */
+static unsigned
+obj_has_multiprocess_robustness(void)
+{
+	/* robust by default */
+	unsigned ret = 1;
+	char *env = os_getenv(OBJ_MULTIPROCESS_ROBUSTNESS_ENV_VARIABLE);
+	if (env) {
+		if (strlen(env) > 1 || (env[0] != '0' && env[0] != '1')) {
+			ERR("%s variable must be either 0 (false) or 1 (true)",
+				OBJ_MULTIPROCESS_ROBUSTNESS_ENV_VARIABLE);
+			errno = EINVAL;
+			goto no_valid_env;
+		}
+
+		ret = (unsigned)atoi(env);
+	}
+
+no_valid_env:
+	LOG(3, ":%s ", ret ? "true" : "false");
+	return ret;
+}
+
+/*
+ * obj_crash_check_and_recover -- checks if all currently attached
+ * processes are alive and recovers their lanes otherwise.
+ * Returns the number of successfully recovered processes.
+ */
+int
+obj_crash_check_and_recover(PMEMobjpool *pop)
+{
+	LOG(3, "pop %p", pop);
+
+	if (!obj_has_multiprocess_robustness())
+		return 1;
+
+	struct registry_entries entries;
+	SLIST_INIT(&entries);
+
+	/*
+	 * We need to hold that lock for the entire recovery operation to
+	 * prevent duplicate recovery from other thread/processes
+	 * of the same lanes.
+	 */
+	int err = registry_hold(pop->registry);
+	switch (err) {
+		case 0:
+			/* proceed */
+			break;
+		case EOWNERDEAD:
+			/*
+			 * XXX mp-mode
+			 * Another process/thread died while holding the lock.
+			 * The underlying shm_list implementation
+			 * does not use transactions and thus might be in a
+			 * corrupt state. A single logical list operations
+			 * comprises at least two stores: updating a tail
+			 * pointer and the next pointer.
+			 * As a consequence we should not continue.
+			 *
+			 * But in future (once a transactional reqistration
+			 * mechanism is implemented) we might make the lock
+			 * consistent and proceed.
+			 */
+		case ETIMEDOUT:
+			/*
+			 * XXX mp-mode
+			 * The registry is a single point of failure.
+			 * While another process holds the lock, we can do
+			 * nothing but wait and retry.
+			 *
+			 * Sadly, in some cases the locked mutex might
+			 * return ETIMEDOUT although the lock holder crashed.
+			 * In that case there is nothing we can do but abort
+			 * until we find a better solution and found the real
+			 * cause for that (probably undefined) behaviour.
+			 *
+			 * Recovery might be already running in another thread
+			 * and we have to wait until it is finished.
+			 * If we can't obtain the lock in the specified time,
+			 * there is probably some greater problem that we
+			 * can't resolve and we abort as a safety measure.
+			 */
+		default:
+			ERR("registry_hold");
+			errno = err;
+			return -1;
+	}
+
+	/* check if any processes crashed */
+	registry_check_crashed(pop->registry, &entries, pop->proc_idx);
+
+	/* iterate the list of crashed processes and recover */
+	int recovered = 0;
+	struct lane_range lrange;
+	while (!SLIST_EMPTY(&entries)) {
+		struct registry_entry *entry = SLIST_FIRST(&entries);
+
+		/*
+		 * Process all redo/undo logs
+		 *
+		 * Regarding the allocator section:
+		 * The crashed process could only alloc memory that was
+		 * free, before it crashed.
+		 * Another process is not allowed to alloc memory until it
+		 * acquired the region lock.
+		 *
+		 * The consequence from the above points:
+		 * As long as the crashed process' region remains locked,
+		 * the persistent state is protected against modifications
+		 * that might corrupt the region.
+		 * It is safe to process the redo log while another process
+		 * concurrently frees memory from the region that is unrelated
+		 * to the entries in the redo log.
+		 * If another process tries to operate on the same run that
+		 * is already contained in the redo log, then the process
+		 * gets EOWNERDEAD while trying to aquire the run lock and
+		 * subsequently has to run recovery.
+		 */
+		/* Lanes */
+		registry_get_lanes_by_idx(pop->registry, &lrange,
+			(unsigned)entry->idx);
+		if (lane_recover(pop, &lrange) != 0) {
+			FATAL("lane_recover");
+		}
+
+		/*
+		 * Regions
+		 *
+		 * it is important that the region locks are released only
+		 * after all lanes are recovered.
+		 */
+		palloc_region_reset(&pop->heap, (unsigned)entry->idx);
+
+		/*
+		 * XXX mp-mode -- handle unlocked locks
+		 * A crashed process might hold other shared locks while it
+		 * crashed, e.g., runlocks. We don't know exactly which ones
+		 * and have no choice other than to iterate all possibilities
+		 * or delegate the discovery of those to other processes, which
+		 * than in turn have to run recovery again. For simplicity, we
+		 * decide for the last option, but checking all possible locks
+		 * might be faster. This needs further investigation.
+		 */
+		registry_remove_by_idx_unlocked(pop->registry,
+			(unsigned)entry->idx);
+
+		recovered++;
+
+		SLIST_REMOVE_HEAD(&entries, entry);
+		Free(entry);
+	}
+
+	registry_release(pop->registry);
+	LOG(2, "Recovery found %d dead processes", recovered);
+
+	return 0;
+}
+
+/*
+ * obj_boot -- (internal) boots the pmemobj pool
+ */
+static int
+obj_boot(PMEMobjpool *pop)
+{
+	LOG(3, "pop %p", pop);
+
+	if (pop->is_primary) {
+		if ((errno = obj_recover(pop)) != 0) {
+			ERR("!obj_recover");
+			return errno;
+		}
+		pop->pool_desc->conversion_flags = 0;
+		pmemops_persist(&pop->p_ops, &pop->pool_desc->conversion_flags,
+		    sizeof(pop->pool_desc->conversion_flags));
+
+		if (pop->mp_mode && (errno = obj_change_shared_state(pop,
+			READY)) != 0) {
+			ERR("!obj_change_shared_state");
+			return errno;
+		}
+	} else {
+		if ((errno = obj_wait_until_state(pop, READY)) != 0) {
+			ERR("!obj_wait_until_state");
+			return errno;
+		}
+	}
+
+	pop->lane_range = obj_assign_lane_range_new(pop);
+
+	if ((errno = lane_boot(pop)) != 0) {
+		ERR("!lane_boot");
+		return errno;
+	}
+
+	if (!pop->is_primary && ((errno = lane_section_boot(pop)) != 0)) {
+		ERR("!lane_section_boot");
+		return errno;
+	}
 
 	return 0;
 }
@@ -748,56 +1251,62 @@ obj_descr_create(PMEMobjpool *pop, const char *layout, size_t poolsize)
 	ASSERTeq(poolsize % Pagesize, 0);
 
 	/* opaque info lives at the beginning of mapped memory pool */
-	void *dscp = (void *)((uintptr_t)pop +
-				sizeof(struct pool_hdr));
+	pop->pool_desc = (struct pool_descriptor *)((uintptr_t)pop->base_addr
+	    + POOL_HDR_SIZE);
 
 	/* create the persistent part of pool's descriptor */
-	memset(dscp, 0, OBJ_DSC_P_SIZE);
+	memset(pop->pool_desc, 0, OBJ_DSC_P_SIZE);
 	if (layout)
-		strncpy(pop->layout, layout, PMEMOBJ_MAX_LAYOUT - 1);
+		strncpy(pop->pool_desc->layout, layout, PMEMOBJ_MAX_LAYOUT - 1);
 	struct pmem_ops *p_ops = &pop->p_ops;
 
-	pop->lanes_offset = OBJ_LANES_OFFSET;
-	pop->nlanes = OBJ_NLANES;
+	pop->pool_desc->lanes_offset = OBJ_LANES_OFFSET;
+	pop->pool_desc->nlanes = OBJ_NLANES;
 
 	/* zero all lanes */
-	void *lanes_layout = (void *)((uintptr_t)pop + pop->lanes_offset);
-	pmemops_memset_persist(p_ops, lanes_layout, 0,
-				pop->nlanes * sizeof(struct lane_layout));
+	void *lanes_layout = (void *)((uintptr_t)pop->base_addr +
+	    pop->pool_desc->lanes_offset);
+	size_t lanessize = pop->pool_desc->nlanes * sizeof(struct lane_layout);
+	pmemops_memset_persist(p_ops, lanes_layout, 0, lanessize);
 
-	pop->heap_offset = pop->lanes_offset +
-		pop->nlanes * sizeof(struct lane_layout);
-	pop->heap_offset = (pop->heap_offset + Pagesize - 1) & ~(Pagesize - 1);
-	pop->heap_size = poolsize - pop->heap_offset;
+	pop->pool_desc->heap_offset = pop->pool_desc->lanes_offset + lanessize;
+	pop->pool_desc->heap_offset = (pop->pool_desc->heap_offset +
+	    Pagesize - 1) & ~(Pagesize - 1);
+	pop->pool_desc->heap_size = poolsize - pop->pool_desc->heap_offset;
 
 	/* initialize heap prior to storing the checksum */
-	errno = palloc_init((char *)pop + pop->heap_offset, pop->heap_size,
+	errno = palloc_init((char *)pop->base_addr +
+	    pop->pool_desc->heap_offset, pop->pool_desc->heap_size,
 			p_ops);
 	if (errno != 0) {
 		ERR("!palloc_init");
 		return -1;
 	}
 
-	util_checksum(dscp, OBJ_DSC_P_SIZE, &pop->checksum, 1);
+	util_checksum(pop->pool_desc, OBJ_DSC_P_SIZE,
+	    &pop->pool_desc->checksum, 1);
 
 	/* store the persistent part of pool's descriptor (2kB) */
-	pmemops_persist(p_ops, dscp, OBJ_DSC_P_SIZE);
+	pmemops_persist(p_ops, pop->pool_desc, OBJ_DSC_P_SIZE);
 
 	/* initialize run_id, it will be incremented later */
-	pop->run_id = 0;
-	pmemops_persist(p_ops, &pop->run_id, sizeof(pop->run_id));
+	pop->pool_desc->run_id = 0;
+	pmemops_persist(p_ops, &pop->pool_desc->run_id,
+	    sizeof(pop->pool_desc->run_id));
 
-	pop->root_offset = 0;
-	pmemops_persist(p_ops, &pop->root_offset, sizeof(pop->root_offset));
-	pop->root_size = 0;
-	pmemops_persist(p_ops, &pop->root_size, sizeof(pop->root_size));
+	pop->pool_desc->root_offset = 0;
+	pmemops_persist(p_ops, &pop->pool_desc->root_offset,
+	    sizeof(pop->pool_desc->root_offset));
+	pop->pool_desc->root_size = 0;
+	pmemops_persist(p_ops, &pop->pool_desc->root_size,
+	    sizeof(pop->pool_desc->root_size));
 
-	pop->conversion_flags = 0;
-	pmemops_persist(p_ops, &pop->conversion_flags,
-		sizeof(pop->conversion_flags));
+	pop->pool_desc->conversion_flags = 0;
+	pmemops_persist(p_ops, &pop->pool_desc->conversion_flags,
+	    sizeof(pop->pool_desc->conversion_flags));
 
-	pmemops_memset_persist(p_ops, pop->pmem_reserved, 0,
-		sizeof(pop->pmem_reserved));
+	pmemops_memset_persist(p_ops, pop->pool_desc->pmem_reserved, 0,
+	    sizeof(pop->pool_desc->pmem_reserved));
 
 	return 0;
 }
@@ -810,7 +1319,7 @@ obj_descr_check(PMEMobjpool *pop, const char *layout, size_t poolsize)
 {
 	LOG(3, "pop %p layout %s poolsize %zu", pop, layout, poolsize);
 
-	void *dscp = (void *)((uintptr_t)pop + sizeof(struct pool_hdr));
+	struct pool_descriptor *dscp = pop->pool_desc;
 
 	if (pop->rpp) {
 		/* read remote descriptor */
@@ -827,17 +1336,17 @@ obj_descr_check(PMEMobjpool *pop, const char *layout, size_t poolsize)
 		pop->size = poolsize;
 	}
 
-	if (!util_checksum(dscp, OBJ_DSC_P_SIZE, &pop->checksum, 0)) {
+	if (!util_checksum(dscp, OBJ_DSC_P_SIZE, &dscp->checksum, 0)) {
 		ERR("invalid checksum of pool descriptor");
 		errno = EINVAL;
 		return -1;
 	}
 
 	if (layout &&
-	    strncmp(pop->layout, layout, PMEMOBJ_MAX_LAYOUT)) {
+	    strncmp(dscp->layout, layout, PMEMOBJ_MAX_LAYOUT)) {
 		ERR("wrong layout (\"%s\"), "
 			"pool created with layout \"%s\"",
-			layout, pop->layout);
+			layout, dscp->layout);
 		errno = EINVAL;
 		return -1;
 	}
@@ -849,17 +1358,17 @@ obj_descr_check(PMEMobjpool *pop, const char *layout, size_t poolsize)
 		return -1;
 	}
 
-	if (pop->heap_offset + pop->heap_size != poolsize) {
+	if (dscp->heap_offset + dscp->heap_size != poolsize) {
 		ERR("heap size does not match pool size: %" PRIu64 " != %zu",
-			pop->heap_offset + pop->heap_size, poolsize);
+			dscp->heap_offset + dscp->heap_size, poolsize);
 		errno = EINVAL;
 		return -1;
 	}
 
-	if (pop->heap_offset % Pagesize ||
-	    pop->heap_size % Pagesize) {
+	if (dscp->heap_offset % Pagesize ||
+	    dscp->heap_size % Pagesize) {
 		ERR("unaligned heap: off %" PRIu64 ", size %" PRIu64,
-			pop->heap_offset, pop->heap_size);
+			dscp->heap_offset, dscp->heap_size);
 		errno = EINVAL;
 		return -1;
 	}
@@ -930,8 +1439,8 @@ obj_replica_init_remote(PMEMobjpool *rep, struct pool_set *set,
 	rep->node_addr = Strdup(repset->remote->node_addr);
 	if (rep->node_addr == NULL)
 		return -1;
-	rep->pool_desc = Strdup(repset->remote->pool_desc);
-	if (rep->pool_desc == NULL) {
+	rep->rpool_desc = Strdup(repset->remote->pool_desc);
+	if (rep->rpool_desc == NULL) {
 		Free(rep->node_addr);
 		return -1;
 	}
@@ -967,7 +1476,7 @@ obj_cleanup_remote(PMEMobjpool *pop)
 	for (; pop != NULL; pop = pop->replica) {
 		if (pop->rpp != NULL) {
 			Free(pop->node_addr);
-			Free(pop->pool_desc);
+			Free(pop->rpool_desc);
 			pop->rpp = NULL;
 		}
 	}
@@ -981,6 +1490,34 @@ redo_log_check_offset(void *ctx, uint64_t offset)
 {
 	PMEMobjpool *pop = ctx;
 	return OBJ_OFF_IS_VALID(pop, offset);
+}
+
+/*
+ * pmemobjpool_delete -- free an pmemobjpool
+ */
+void
+pmemobjpool_delete(PMEMobjpool *pop)
+{
+	LOG(4, "pop %p", pop);
+	ASSERTne(pop, NULL);
+	Free(pop);
+}
+
+/*
+ * pmemobjpool_new -- allocates and initializes volatile pmemobjpool instance
+ */
+PMEMobjpool *
+pmemobjpool_new(void)
+{
+	struct pmemobjpool *p = Zalloc(sizeof(*p));
+	if (p == NULL)
+		return NULL;
+	LOG(4, "allocated new pop %p", p);
+
+	p->lock_fd = -1;
+	p->mp_mode = obj_has_multiprocess_support();
+
+	return p;
 }
 
 /*
@@ -1011,6 +1548,7 @@ obj_replica_init(PMEMobjpool *rep, struct pool_set *set, unsigned repidx,
 			rep->p_ops.memset_persist = obj_norep_memset_persist;
 		}
 		rep->p_ops.base = rep;
+		rep->p_ops.base_p = rep->base_addr;
 		rep->p_ops.pool_size = rep->size;
 	} else {
 		/* non-master replicas */
@@ -1024,10 +1562,11 @@ obj_replica_init(PMEMobjpool *rep, struct pool_set *set, unsigned repidx,
 		rep->p_ops.memset_persist = NULL;
 
 		rep->p_ops.base = NULL;
+		rep->p_ops.base_p = NULL;
 		rep->p_ops.pool_size = 0;
 	}
 
-	rep->is_dev_dax = set->replica[repidx]->part[0].is_dev_dax;
+	rep->is_dev_dax = repset->part[0].is_dev_dax;
 
 	int ret;
 	if (repset->remote)
@@ -1037,7 +1576,7 @@ obj_replica_init(PMEMobjpool *rep, struct pool_set *set, unsigned repidx,
 	if (ret)
 		return ret;
 
-	rep->redo = redo_log_config_new(rep->addr, &rep->p_ops,
+	rep->redo = redo_log_config_new(rep->base_addr, &rep->p_ops,
 			redo_log_check_offset, rep, REDO_NUM_ENTRIES);
 	if (!rep->redo)
 		return -1;
@@ -1049,14 +1588,474 @@ obj_replica_init(PMEMobjpool *rep, struct pool_set *set, unsigned repidx,
  * obj_replica_fini -- (internal) deinitialize replica
  */
 static void
-obj_replica_fini(struct pool_replica *repset)
+obj_replica_fini(PMEMobjpool *rep, int has_remote)
 {
-	PMEMobjpool *rep = repset->part[0].addr;
-
-	if (repset->remote)
+	if (has_remote)
 		obj_cleanup_remote(rep);
 
 	redo_log_config_delete(rep->redo);
+
+	pmemobjpool_delete(rep);
+}
+
+/*
+ * obj_build_suffix_file -- (internal) create a pathname with a given suffix
+ */
+static inline const char *
+obj_build_suffix_file(PMEMobjpool *pop, const char *fmt)
+{
+	const char *path = pop->set->replica[0]->part[0].path;
+	/* static, thus auto-initialized to zero */
+	static char buffer[PATH_MAX];
+	snprintf(buffer, sizeof(buffer) - 1, fmt, path);
+
+	return buffer;
+}
+
+/*
+ * obj_open_suffix_file -- (internal) opens the given file and sets
+ * permissions and flags
+ */
+static int
+obj_open_suffix_file(PMEMobjpool *pop, const char *pathname)
+{
+	LOG(3, "pop %p", pop);
+
+	int fd;
+	int openFlags = O_RDWR | O_CREAT;
+
+	/*
+	 * XXX mp-mode -- defer chmod until later invocation
+	 * of util_poolset_chmod(). Otherwise we have divergent permission.
+	 */
+	struct stat sStat;
+
+	/*
+	 * Call fstat() to figure out the permissions on the pool file. If
+	 * a new *-shm file is created, an attempt will be made to create it
+	 * with the same permissions.
+	 */
+	if (os_fstat(pop->set->replica[0]->part[0].fd, &sStat) != 0) {
+		ERR("!fstat");
+		goto err_stat;
+	}
+
+	errno = 0;
+
+	if ((fd = os_open(pathname, openFlags, 0660)) < 0) {
+		ERR("open shm file");
+		goto err_lock_open;
+	}
+
+#ifndef _WIN32
+	/*
+	 * If this process is running as root, make sure that the SHM file
+	 * is owned by the same user that owns the original pool.
+	 * Otherwise, the original owner will not be able to connect.
+	 */
+	if (fchown(fd, sStat.st_uid, sStat.st_gid) == -1) {
+		ERR("!chown");
+		goto err_shm;
+	}
+#endif
+
+	int flags;
+	/* Make sure file gets correctly closed when process finished.  */
+	flags = fcntl(fd, F_GETFD, 0);
+	if (flags == -1) {
+		/* Cannot get file flags.  */
+		goto err_shm;
+	}
+	flags |= FD_CLOEXEC;		/* Close on exit.  */
+	if (fcntl(fd, F_SETFD, flags) < 0) {
+		/* Cannot set new flags.  */
+		goto err_shm;
+	}
+
+	return fd;
+
+err_shm:
+	(void) os_close(fd);
+
+err_stat:
+err_lock_open:
+	return -1;
+}
+
+/*
+ * obj_shm_setup -- (internal) setup the shared memory
+ *
+ * Locking procedure:
+ * 1. create or open lock file.
+ * - try to lock it exclusively
+ * 	- on success, we know that no other process is alive and it is safe to
+ * 	cleanup
+ * 	- on failure, we know cleanup is done from another process
+ * - we upgrade the lock to shared or wait until cleanup is finished.
+ * 2. Shared memory
+ * - first process creates and initializes shared memory
+ * - other processes attach and spin until initialization is finished
+ * 3. After initialization access to shared memory is protected via mutex
+ *
+ */
+static int
+obj_shm_setup(PMEMobjpool *pop, int create)
+{
+	LOG(3, "pop %p", pop);
+
+	size_t shm_size = MMAP_ALIGN_UP(sizeof(struct obj_shared_env));
+	struct obj_shared_env *env;
+	int oerrno = errno;
+	errno = 0;
+	if (create) {
+		if (OBJ_SHM_USE_POSIX) {
+			size_t len = 1 + strlen(OS_SHM_PREFIX) + 1 + 64 + 1;
+			char SEG_NAME[len];
+			snprintf(SEG_NAME, sizeof(SEG_NAME), "/%s_%lu",
+			    OS_SHM_PREFIX, pop->uuid_lo);
+
+			/* remove former leftovers from crashed processes */
+			os_shm_unlink(SEG_NAME);
+			if ((env = (struct obj_shared_env *)os_shm_get_posix(
+				SEG_NAME, shm_size, O_CREAT | O_EXCL |
+						    O_RDWR)) == NULL) {
+				ERR("shm initializing failed");
+
+				goto err_shm;
+			}
+			LOG(3, "Created shared memory segment \"%s\" "
+				    " of size %zu\n",
+				SEG_NAME, shm_size);
+			pop->shm_path = strdup(SEG_NAME);
+		} else {
+			if (os_ftruncate(pop->shm_fd, (off_t)shm_size) != 0) {
+				ERR("ftruncate increase");
+
+				goto err_shm;
+			}
+
+			if ((env = (struct obj_shared_env *)os_shm_get_mmap(
+			    pop->shm_fd, shm_size)) == NULL) {
+				ERR("shm initializing failed");
+				goto err_shm;
+			}
+			memset(env, 0, sizeof(*env));
+		}
+
+		if (errno) {
+			ERR("!connected to shm, but an error occured");
+
+			goto err_shm_mapped;
+		}
+
+		/* successfully mapped, continue with initialzation */
+		util_mutex_init_mp(&env->lock);
+		util_cond_init_mp(&env->cond);
+
+		env->magic = OBJ_SHM_MAGIC;
+
+		for (unsigned i = 0; i < pop->pool_desc->nlanes; ++i) {
+			env->lane_locks[i] = 0;
+		}
+		env->area_size = shm_size;
+
+		pop->lanes_desc.lane = env->lane;
+		pop->lanes_desc.lane_locks = env->lane_locks;
+		pop->registry = registry_new(env->shm_registry, pop->lock_fd,
+			1 /* initialize */, pop->pool_desc->nlanes);
+
+		pop->shrd = env;
+
+		if (obj_change_shared_state(pop, MTX_INITIALIZED) != 0)
+			goto err_obj_change_shared_state;
+	} else {
+		/* attaching to existing segment */
+		if (OBJ_SHM_USE_POSIX) {
+			size_t len = 1 + strlen(OS_SHM_PREFIX) + 1 + 64 + 1;
+			char SEG_NAME[len];
+			snprintf(SEG_NAME, sizeof(SEG_NAME), "/%s_%lu",
+			    OS_SHM_PREFIX, pop->uuid_lo);
+			env = (struct obj_shared_env *)os_shm_get_posix(
+				SEG_NAME, shm_size, O_RDWR);
+			LOG(3, "Attached to existing shared memory segment "
+			    "\"%s\" of size %zu\n",
+				SEG_NAME, shm_size);
+			pop->shm_path = strdup(SEG_NAME);
+		} else {
+			env = (struct obj_shared_env *)os_shm_get_mmap(
+			    pop->shm_fd, shm_size);
+		}
+
+		if (env == NULL) {
+			ERR("!could not mmap shm");
+			goto err_shm;
+		}
+
+		/*
+		 * We block until proper synchronization is available or
+		 * the timeout is reached.
+		 * We have to rely on a spin lock until shared mutexes
+		 * are initialized.
+		 */
+		while (env->magic != OBJ_SHM_MAGIC &&
+		    obj_invoke_busy_handler(&pop->busy_handler))
+			__sync_synchronize();
+
+		if (env->magic != OBJ_SHM_MAGIC)
+			goto err_shm_timeout;
+
+		pop->lanes_desc.lane = env->lane;
+		pop->lanes_desc.lane_locks = env->lane_locks;
+		pop->registry = registry_new(env->shm_registry, pop->lock_fd,
+			0 /* already initialized */, 0);
+		pop->shrd = env;
+	}
+
+	errno = oerrno;
+
+	return 0;
+
+err_obj_change_shared_state:
+	util_mutex_destroy(&pop->shrd->lock);
+	util_cond_destroy(&pop->shrd->cond);
+
+err_shm_timeout:
+err_shm_mapped:
+	util_unmap(pop->shrd, pop->shrd->area_size);
+	if (OBJ_SHM_USE_POSIX)
+		os_shm_unlink(pop->shm_path);
+err_shm:
+	return -1;
+}
+
+/*
+ * obj_shm_boot -- (internal) boots the shared memory part
+ */
+static int
+obj_shm_boot(PMEMobjpool *pop, int create)
+{
+	LOG(3, "pop %p", pop);
+
+	ASSERTeq(pop->shrd, NULL);
+
+	if (obj_shm_setup(pop, create) != 0)
+		FATAL("!obj_shm_setup");
+
+	ASSERTne(pop->shrd, NULL);
+
+	return 0;
+}
+
+static int
+obj_runtime_init_primary(PMEMobjpool *pop)
+{
+	LOG(3, "pid %d is the primary process", getpid());
+
+	/*
+	 * when the lock was granted there is no other process and
+	 * we are in charge for initialization
+	 */
+	pop->is_primary = 1;
+
+	if (obj_shm_boot(pop, pop->is_primary /* create */) != 0) {
+		ERR("!obj_shm_boot");
+		pop->is_primary = 0;
+
+		return -1;
+	}
+
+	int ret;
+	if ((ret = registry_add(pop->registry)) == -1)
+		return -1;
+	ASSERT(ret >= 0);
+	pop->proc_idx = (unsigned)ret;
+
+	return 0;
+}
+
+/*
+ * obj_runtime_init_secondary -- (internal) initialization for non-leading
+ * processes
+ */
+static int
+obj_runtime_init_secondary(PMEMobjpool *pop)
+{
+	LOG(4, "Already locked by another (init) process. Waiting...");
+
+	int ret;
+	do {
+		/*
+		 * block until shm is initialized
+		 *
+		 * The leader might crash during initialization. Thus we could
+		 * obtain a read lock and thus gain access to uninitialized
+		 * shared memory.
+		 *
+		 * We check this in obj_shm_boot(). If the shared memory is
+		 * uninitialized we will immediately detach and retry in next
+		 * round
+		 */
+		ret = util_read_lock(pop->lock_fd, OBJ_LOCK_POOL, SEEK_SET, 1);
+		if (ret != 0 && (errno != EACCES && errno != EAGAIN)) {
+			ERR("util_read_lock returned unknown error");
+			goto err_lock;
+		}
+	} while (ret == -1 && obj_invoke_busy_handler(&pop->busy_handler));
+
+	if (ret == -1)
+		goto err_timeout;
+
+	/* Finally, we are ready to attach to shm */
+	if (obj_shm_boot(pop, 0 /* open only */) != 0) {
+		ERR("!obj_shm_boot");
+		goto err_shm;
+	}
+
+	/*
+	 * So far initialization is done,
+	 * but we need to block until the leading process has
+	 * properly booted the pool.
+	 *
+	 * From now on we can rely on shared posix mutexes
+	 */
+	if (obj_wait_until_state(pop, SHM_RUNTIME_INITIALIZED) != 0)
+		goto err_obj_wait_until_state;
+
+	if ((ret = registry_add(pop->registry)) == -1) {
+		goto err_registry_add;
+
+#if 0
+		/*
+		 * XXX mp-mode
+		 *
+		 * execute recovery without booting heap
+		 *
+		 * With current implentation, we can't run recovery
+		 * because the heap functions expect a properly booted heap.
+		 * But at this position in code it was not booted, yet.
+		 */
+		if (errno != ENOMEM)
+			goto err_registry_add;
+
+		/*
+		 * the registry has no free slots, so check if we
+		 * can free some via recovery
+		 */
+		if (obj_check_liveliness_and_recover(pop) == 0 &&
+		    (ret = registry_add(pop->registry, getpid())) == -1)
+				goto err_registry_add;
+#endif
+	}
+	ASSERT(ret >= 0);
+	pop->proc_idx = (unsigned)ret;
+
+	return 0;
+
+err_registry_add:
+err_obj_wait_until_state:
+	/*
+	 * util_unmap(pop->shrd, pop->shrd->area_size);
+	 * if (OBJ_SHM_USE_POSIX)
+	 *	os_shm_unlink(pop->shm_path);
+	 */
+	pop->shrd = NULL;
+	pop->shm_path = NULL;
+err_timeout:
+err_lock:
+err_shm:
+	return -1;
+}
+
+/*
+ * obj_runtime_init_boot_mp -- (internal) locked initialization with timeout.
+ *  Dead man switch inspired by sqlite3 source (os_unix.c)
+ */
+static int
+obj_runtime_init_boot_mp(PMEMobjpool *pop)
+{
+	LOG(3, "pop %p", pop);
+
+	if (util_write_lock(pop->lock_fd, OBJ_LOCK_POOL, SEEK_SET, 1) == 0) {
+		if (os_ftruncate(pop->lock_fd, (off_t)OBJ_LOCKFILE_SIZE) != 0) {
+			ERR("!ftruncate");
+			return -1;
+		}
+
+		int ret = obj_runtime_init_primary(pop);
+
+		/*
+		 * We obtained a mutex in obj_runtime_init_primary/obj_shm_boot
+		 * that we need to hold until obj_boot completed
+		 * Thus, it is safe to downgrade the exclusive lock to shared.
+		 */
+		if (util_read_lock(pop->lock_fd, OBJ_LOCK_POOL, SEEK_SET, 1)
+		    != 0) {
+			ERR("run_lock returned unknown error");
+			return -1;
+		}
+
+		return ret;
+	} else {
+		if (errno == EACCES || errno == EAGAIN) {
+			return obj_runtime_init_secondary(pop);
+		} else {
+			ERR("F_SETLK unknown error");
+			return -1;
+		}
+	}
+
+	ASSERT(0);
+}
+
+#define NDELAY (int)ARRAY_SIZE(delays)
+
+/*
+ * This routine implements a busy callback that sleeps and tries
+ * again until a timeout value is reached.  The timeout value is
+ * an integer number of milliseconds passed in as the first
+ * argument.
+ *
+ * Returns 0 when timeout was exceeded otherwise 1
+ */
+static int obj_busy_cb_def(void *ptr, int count)
+{
+	ASSERT(count >= 0);
+	static const uint8_t delays[] =
+		{ 1, 2, 5, 10, 15, 20, 25, 25,  25,  50,  50, 100 };
+	static const uint8_t  totals[] =
+		{ 0, 1, 3,  8, 18, 33, 53, 78, 103, 128, 178, 228 };
+	PMEMobjpool *pop = (PMEMobjpool *)ptr;
+	int timeout = pop->busyTimeout;
+	int delay;
+	int prior;
+
+	if (count < NDELAY) {
+		delay = delays[count];
+		prior = totals[count];
+	} else {
+		delay = delays[NDELAY - 1];
+		prior = totals[NDELAY - 1] + delay * (count - (NDELAY - 1));
+	}
+	if (prior + delay > timeout) {
+		delay = timeout - prior;
+		if (delay <= 0)
+			return 0;
+	}
+	usleep((useconds_t)delay * 1000);
+
+	return 1;
+}
+
+/*
+ * obj_mutex_timedlock_mp -- wraps pmemobj_mutex_timedlock_mp
+ * to pass in a default timeout
+ */
+static int
+obj_mutex_timedlock_mp(PMEMobjpool *pop, PMEMmutex *__restrict mutexp)
+{
+	LOG(3, "pop %p mutex %p", pop, mutexp);
+	struct timespec ts;
+	return pmemobj_mutex_timedlock_mp(pop, mutexp, mp_set_mtx_timeout(&ts));
 }
 
 /*
@@ -1068,11 +2067,7 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 	LOG(3, "pop %p rdonly %d boot %d", pop, rdonly, boot);
 	struct pmem_ops *p_ops = &pop->p_ops;
 
-	/* run_id is made unique by incrementing the previous value */
-	pop->run_id += 2;
-	if (pop->run_id == 0)
-		pop->run_id += 2;
-	pmemops_persist(p_ops, &pop->run_id, sizeof(pop->run_id));
+	pop->uuid_lo = pmemobj_get_uuid_lo((const PMEMobjpool *)pop->base_addr);
 
 	/*
 	 * Use some of the memory pool area for run-time info.  This
@@ -1080,8 +2075,6 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 	 * created here, so no need to worry about byte-order.
 	 */
 	pop->rdonly = rdonly;
-
-	pop->uuid_lo = pmemobj_get_uuid_lo(pop);
 
 	pop->lanes_desc.runtime_nlanes = nlanes;
 
@@ -1097,8 +2090,79 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 	}
 
 	if (boot) {
+		if (pop->mp_mode) {
+			pop->pmem_lock = obj_mutex_timedlock_mp;
+			pop->pmem_unlock = pmemobj_mutex_unlock_mp;
+
+			obj_register_busy_handler(pop, obj_busy_cb_def,
+				(void *) pop);
+			pop->busyTimeout = 1000;
+
+			if (obj_open_mp_files(pop) != 0) {
+				ERR("obj_open_mp_files");
+			}
+			int retries = OBJ_SHM_INIT_RETRIES;
+			while (obj_runtime_init_boot_mp(pop) != 0) {
+				if (errno == EOWNERDEAD) {
+					ERR("dead process detected.  registry"
+					    " might be corrupted.");
+					goto err_mp_init;
+
+				}
+				if (errno == ETIMEDOUT) {
+					ERR("Could not obtain lock initialize "
+					    "in specified time. giving up.");
+					goto err_mp_init;
+
+				}
+				if (!retries) {
+					ERR("obj_runtime_init_boot_mp max "
+					    "retries reached. giving up.");
+					goto err_mp_init;
+				}
+				--retries;
+				sched_yield();
+			}
+		} else {
+			/* single process init */
+			pop->is_primary = 1;
+
+			pop->pmem_lock = pmemobj_mutex_lock;
+			pop->pmem_unlock = pmemobj_mutex_unlock;
+
+			pop->lanes_desc.lane =
+			    Malloc(OBJ_NLANES * sizeof(struct lane));
+			pop->lanes_desc.lane_locks =
+			    Zalloc(OBJ_NLANES * sizeof(uint64_t));
+		}
+
+		if (pop->is_primary) {
+			/*
+			 * run_id is made unique by incrementing
+			 * the previous value
+			 */
+			pop->pool_desc->run_id += 2;
+			if (pop->pool_desc->run_id == 0)
+				pop->pool_desc->run_id += 2;
+			pmemops_persist(p_ops,
+				&pop->pool_desc->run_id,
+				sizeof(pop->pool_desc->run_id));
+
+			if (pop->mp_mode) {
+				/*
+				 * finally the pool is ready for others to
+				 * proceed
+				 */
+				if (obj_change_shared_state(pop,
+					SHM_RUNTIME_INITIALIZED) != 0)
+					goto err_primary_change_shared_state;
+			}
+		}
+
+		LOG(4, "run_id: %" PRIu64, pop->pool_desc->run_id);
+
 		if ((errno = obj_boot(pop)) != 0)
-			return -1;
+			goto err_boot;
 
 
 #ifdef USE_VG_MEMCHECK
@@ -1106,7 +2170,7 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 			/* mark unused part of the pool as not accessible */
 			void *end = palloc_heap_end(&pop->heap);
 			VALGRIND_DO_MAKE_MEM_NOACCESS(end,
-					(char *)pop + pop->size - (char *)end);
+			    (char *)pop->base_addr + pop->size - (char *)end);
 		}
 #endif
 
@@ -1119,7 +2183,14 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 			goto err;
 		}
 
-		if ((errno = ctree_insert(pools_tree, (uint64_t)pop, pop->size))
+		if ((errno = cuckoo_insert(pools_trans_ht,
+		    (uint64_t)pop->base_addr, pop)) != 0) {
+			ERR("!cuckoo_insert");
+			goto err;
+		}
+
+		if ((errno = ctree_insert(pools_tree,
+		    (uint64_t)pop->base_addr, pop->size))
 				!= 0) {
 			ERR("!ctree_insert");
 			goto err;
@@ -1132,15 +2203,84 @@ obj_runtime_init(PMEMobjpool *pop, int rdonly, int boot, unsigned nlanes)
 	 * The prototype PMFS doesn't allow this when large pages are in
 	 * use. It is not considered an error if this fails.
 	 */
-	RANGE_NONE(pop->addr, sizeof(struct pool_hdr), pop->is_dev_dax);
+	RANGE_NONE(pop->base_addr, sizeof(struct pool_hdr), pop->is_dev_dax);
 
 	return 0;
 err:
 	ctl_delete(pop->ctl);
 err_ctl:
 	tx_params_delete(pop->tx_params);
+err_boot:
+err_primary_change_shared_state:
+	if (pop->mp_mode) {
+		/*
+		 * For unknown reasons unmapping the shared memory during
+		 * shutdown (exit(0)) in the child process while it is
+		 * holding a mutex causes the parent to crash when accessing
+		 * the mutex.
+		 */
+		/* util_unmap(pop->shrd, pop->shrd->area_size); */
+		pop->shrd = NULL;
+	}
+err_mp_init:
+	pop->shm_fd = -1;
+	(void) os_close(pop->shm_fd);
 
 	return -1;
+}
+
+static int
+obj_open_mp_files(PMEMobjpool *pop)
+{
+	/* open lock file */
+	const char *lock_path = obj_build_suffix_file(pop,
+		FILE_SUFFIX_LOCK);
+
+	/*
+	 * XXX mp-mode --  (windows) locking in windows is mandatory
+	 * see Sqlite book p.101
+	 *
+	 * reserve an entire page for locks.
+	 * This page must not store data
+	 */
+	if ((pop->lock_fd = obj_open_suffix_file(pop, lock_path)) < 0) {
+		ERR("!obj_open_suffix_file %s", lock_path);
+		return -1;
+	}
+
+	/*
+	 * hold a read lock for entire lifetime (dead man switch)
+	 * As long as we hold the lock the shared state of the pool must not be
+	 * closed  by others.
+	 */
+	if (util_read_lock(pop->lock_fd, OBJ_LOCK_DMS, SEEK_SET, 1) != 0 &&
+	    obj_invoke_busy_handler(&pop->busy_handler)) {
+		/*
+		 * This lock is exclusivly held during
+		 * pool cleanup. If we reached the timeout
+		 * something unforseen happend and we are not
+		 * able to recover.
+		 */
+		FATAL("!util_read_lock OBJ_LOCK_DMS");
+	}
+
+	if (!OBJ_SHM_USE_POSIX) {
+		/* open shm file */
+		pop->shm_path = obj_build_suffix_file(
+			pop, FILE_SUFFIX_SHM);
+
+		if ((pop->shm_fd = obj_open_suffix_file(pop,
+			pop->shm_path)) < 0) {
+			ERR("!obj_open_suffix_file %s", pop->shm_path);
+			goto err_shm;
+		}
+	}
+
+	return 0;
+err_shm:
+	pop->lock_fd = -1;
+	(void) os_close(pop->lock_fd);
+return -1;
 }
 
 /*
@@ -1184,7 +2324,7 @@ pmemobj_createU(const char *path, const char *layout,
 	LOG(3, "path %s layout %s poolsize %zu mode %o",
 			path, layout, poolsize, mode);
 
-	PMEMobjpool *pop;
+	PMEMobjpool *pop = NULL;
 	struct pool_set *set;
 
 	/* check length of layout */
@@ -1203,30 +2343,40 @@ pmemobj_createU(const char *path, const char *layout,
 	 */
 	unsigned runtime_nlanes = obj_get_nlanes();
 
-	if (util_pool_create(&set, path, poolsize, PMEMOBJ_MIN_POOL,
+	/*
+	 * When not in multiprocess mode we lock the file with a mandatory lock.
+	 * In mp-mode duplicate open of the same pool is avoided later in the
+	 * code.
+	 */
+	int flock_pool = !obj_has_multiprocess_support();
+	if (util_pool_create(&set, path,
+			poolsize, PMEMOBJ_MIN_POOL,
 			OBJ_HDR_SIG, OBJ_FORMAT_MAJOR,
 			OBJ_FORMAT_COMPAT, OBJ_FORMAT_INCOMPAT,
 			OBJ_FORMAT_RO_COMPAT, &runtime_nlanes,
-			REPLICAS_ENABLED) != 0) {
+			REPLICAS_ENABLED, flock_pool) != 0) {
 		LOG(2, "cannot create pool or pool set");
 		return NULL;
 	}
 
 	ASSERT(set->nreplicas > 0);
 
-	/* pop is master replica from now on */
-	pop = set->replica[0]->part[0].addr;
-
+	PMEMobjpool *prev = NULL;
 	for (unsigned r = 0; r < set->nreplicas; r++) {
 		struct pool_replica *repset = set->replica[r];
-		PMEMobjpool *rep = repset->part[0].addr;
+		PMEMobjpool *rep = pmemobjpool_new();
+		if (r == 0)
+			pop = rep; /* pop is master replica from now on */
 
-		size_t rt_size = (uintptr_t)(rep + 1) - (uintptr_t)&rep->addr;
-		VALGRIND_REMOVE_PMEM_MAPPING(&rep->addr, rt_size);
+		rep->base_addr = repset->part[0].addr;
+		rep->pool_desc =
+		    (struct pool_descriptor *)((uintptr_t)rep->base_addr
+							    + POOL_HDR_SIZE);
+		void *pmem_rt_addr = rep->pool_desc->pmem_reserved;
+		memset(pmem_rt_addr, 0, OBJ_DESC_RT_RESERVED);
+		VALGRIND_REMOVE_PMEM_MAPPING(pmem_rt_addr, OBJ_DESC_RT_RESERVED);
 
-		memset(&rep->addr, 0, rt_size);
-
-		rep->addr = rep;
+		rep->addr = rep->base_addr;
 		rep->size = repset->repsize;
 		rep->replica = NULL;
 		rep->rpp = NULL;
@@ -1238,8 +2388,11 @@ pmemobj_createU(const char *path, const char *layout,
 		}
 
 		/* link replicas */
-		if (r < set->nreplicas - 1)
-			rep->replica = set->replica[r + 1]->part[0].addr;
+		/* set->replica[r + 1]->part[0].addr; */
+		if (prev != NULL)
+			prev->replica = rep;
+
+		prev = rep;
 	}
 
 	pop->set = set;
@@ -1251,8 +2404,7 @@ pmemobj_createU(const char *path, const char *layout,
 	}
 
 	/* initialize runtime parts - lanes, obj stores, ... */
-	if (obj_runtime_init(pop, 0, 1 /* boot */,
-					runtime_nlanes) != 0) {
+	if (obj_runtime_init(pop, 0, 1 /* boot */, runtime_nlanes) != 0) {
 		ERR("pool initialization failed");
 		goto err;
 	}
@@ -1260,9 +2412,12 @@ pmemobj_createU(const char *path, const char *layout,
 	if (util_poolset_chmod(set, mode))
 		goto err;
 
+	/*
+	 * XXX mp-mode -- change permissions for suffix files here
+	 */
 	util_poolset_fdclose(set);
 
-	LOG(3, "pop %p", pop);
+	LOG(3, "created pop with address %p", pop);
 
 	return pop;
 
@@ -1327,8 +2482,8 @@ obj_check_basic_local(PMEMobjpool *pop)
 
 	int consistent = 1;
 
-	if (pop->run_id % 2) {
-		ERR("invalid run_id %" PRIu64, pop->run_id);
+	if (pop->pool_desc->run_id % 2) {
+		ERR("invalid run_id %" PRIu64, pop->pool_desc->run_id);
 		consistent = 0;
 	}
 
@@ -1337,8 +2492,9 @@ obj_check_basic_local(PMEMobjpool *pop)
 		consistent = 0;
 	}
 
-	errno = palloc_heap_check((char *)pop + pop->heap_offset,
-			pop->heap_size);
+	errno = palloc_heap_check((char *)pop->base_addr +
+		    pop->pool_desc->heap_offset,
+		    pop->pool_desc->heap_size);
 	if (errno != 0) {
 		LOG(2, "!heap_check");
 		consistent = 0;
@@ -1386,21 +2542,23 @@ obj_check_basic_remote(PMEMobjpool *pop)
 	int consistent = 1;
 
 	/* read pop->run_id */
-	if (obj_read_remote(pop->rpp, pop->remote_base, &pop->run_id,
-			&pop->run_id, sizeof(pop->run_id))) {
+	if (obj_read_remote(pop->rpp, pop->remote_base,
+	    &pop->pool_desc->run_id, &pop->pool_desc->run_id,
+	    sizeof(pop->pool_desc->run_id))) {
 		ERR("!obj_read_remote");
 		return -1;
 	}
 
-	if (pop->run_id % 2) {
-		ERR("invalid run_id %" PRIu64, pop->run_id);
+	if (pop->pool_desc->run_id % 2) {
+		ERR("invalid run_id %" PRIu64, pop->pool_desc->run_id);
 		consistent = 0;
 	}
 
 	/* XXX add lane_check_remote */
 
-	errno = palloc_heap_check_remote((char *)pop + pop->heap_offset,
-			pop->heap_size, &pop->p_ops.remote);
+	errno = palloc_heap_check_remote((char *)pop->base_addr +
+	    pop->pool_desc->heap_offset,
+			pop->pool_desc->heap_size, &pop->p_ops.remote);
 	if (errno != 0) {
 		LOG(2, "!heap_check_remote");
 		consistent = 0;
@@ -1443,13 +2601,22 @@ static int
 obj_pool_open(struct pool_set **set, const char *path, int cow,
 	unsigned *nlanes)
 {
-
-	if (util_pool_open(set, path, cow, PMEMOBJ_MIN_POOL,
+	if (obj_has_multiprocess_support()) {
+		if (util_pool_open_unlocked(set, path, cow, PMEMOBJ_MIN_POOL,
 			OBJ_HDR_SIG, OBJ_FORMAT_MAJOR,
 			OBJ_FORMAT_COMPAT, OBJ_FORMAT_INCOMPAT,
 			OBJ_FORMAT_RO_COMPAT, nlanes) != 0) {
-		LOG(2, "cannot open pool or pool set");
-		return -1;
+			LOG(2, "cannot open pool or pool set");
+			return -1;
+		}
+	} else {
+		if (util_pool_open(set, path, cow, PMEMOBJ_MIN_POOL,
+			OBJ_HDR_SIG, OBJ_FORMAT_MAJOR,
+			OBJ_FORMAT_COMPAT, OBJ_FORMAT_INCOMPAT,
+			OBJ_FORMAT_RO_COMPAT, nlanes) != 0) {
+			LOG(2, "cannot open pool or pool set");
+			return -1;
+		}
 	}
 
 	ASSERT((*set)->nreplicas > 0);
@@ -1470,21 +2637,29 @@ err_rdonly:
 /*
  * obj_replicas_init -- (internal) initialize all replicas
  */
-static int
+static PMEMobjpool *
 obj_replicas_init(struct pool_set *set)
 {
+	PMEMobjpool *pop = NULL;
+	PMEMobjpool *prev_pop = NULL;
+	PMEMobjpool *tmp = NULL;
 	unsigned r;
 	for (r = 0; r < set->nreplicas; r++) {
 		struct pool_replica *repset = set->replica[r];
-		PMEMobjpool *rep = repset->part[0].addr;
+		PMEMobjpool *rep = pmemobjpool_new();
 
-		size_t rt_size = (uintptr_t)(rep + 1) - (uintptr_t)&rep->addr;
+		if (r == 0)
+			pop = rep;
 
-		VALGRIND_REMOVE_PMEM_MAPPING(&rep->addr, rt_size);
+		/*
+		 * XXX mp-mode -- probably redundant and can be consolidated
+		 */
+		rep->base_addr = repset->part[0].addr;
+		rep->addr = rep->base_addr;
 
-		memset(&rep->addr, 0, rt_size);
+		rep->pool_desc = (void *)((uintptr_t)pop->base_addr
+					    + POOL_HDR_SIZE);
 
-		rep->addr = rep;
 		rep->size = repset->repsize;
 		rep->replica = NULL;
 		rep->rpp = NULL;
@@ -1496,27 +2671,37 @@ obj_replicas_init(struct pool_set *set)
 		}
 
 		/* link replicas */
-		if (r < set->nreplicas - 1)
-			rep->replica = set->replica[r + 1]->part[0].addr;
+		if (prev_pop != NULL)
+			prev_pop->replica = rep;
+
+		prev_pop = rep;
 	}
 
-	return 0;
+	return pop;
 err:
-	for (unsigned p = 0; p < r; p++)
-		obj_replica_fini(set->replica[p]);
+	for (unsigned p = 0; p <= r; p++, pop = tmp) {
+		if (pop == NULL)
+			return NULL;
+		tmp = pop->replica;
+		obj_replica_fini(pop, set->replica[p]->remote != NULL);
+	}
 
-	return -1;
+	return NULL;
 }
 
 /*
  * obj_replicas_fini -- (internal) deinitialize all replicas
  */
 static void
-obj_replicas_fini(struct pool_set *set)
+obj_replicas_fini(PMEMobjpool *rep)
 {
 	int oerrno = errno;
-	for (unsigned r = 0; r < set->nreplicas; r++)
-		obj_replica_fini(set->replica[r]);
+	PMEMobjpool *next = rep;
+	do {
+		rep = next;
+		next = rep->replica;
+		obj_replica_fini(rep, rep->rpp != NULL);
+	} while (next != NULL);
 	errno = oerrno;
 }
 
@@ -1527,23 +2712,21 @@ obj_replicas_fini(struct pool_set *set)
 static int
 obj_replicas_check_basic(PMEMobjpool *pop)
 {
-	PMEMobjpool *rep;
-	for (unsigned r = 0; r < pop->set->nreplicas; r++) {
-		rep = pop->set->replica[r]->part[0].addr;
+	for (PMEMobjpool *rep = pop; rep != NULL; rep = rep->replica) {
 		if (obj_check_basic(rep) == 0) {
-			ERR("inconsistent replica #%u", r);
+			ERR("inconsistent replica #%p", rep);
 			return -1;
 		}
 	}
 
 	/* copy lanes */
-	void *src = (void *)((uintptr_t)pop + pop->lanes_offset);
-	size_t len = pop->nlanes * sizeof(struct lane_layout);
+	void *src = (void *)((uintptr_t)pop->base_addr +
+	    pop->pool_desc->lanes_offset);
+	size_t len = pop->pool_desc->nlanes * sizeof(struct lane_layout);
 
-	for (unsigned r = 1; r < pop->set->nreplicas; r++) {
-		rep = pop->set->replica[r]->part[0].addr;
-		void *dst = (void *)((uintptr_t)rep +
-					pop->lanes_offset);
+	for (PMEMobjpool *rep = pop->replica; rep != NULL; rep = rep->replica) {
+		void *dst = (void *)((uintptr_t)rep->base_addr +
+					pop->pool_desc->lanes_offset);
 		if (rep->rpp == NULL) {
 			rep->memcpy_persist_local(dst, src, len);
 		} else {
@@ -1582,18 +2765,35 @@ obj_open_common(const char *path, const char *layout, int cow, int boot)
 		return NULL;
 
 	/* pop is master replica from now on */
-	pop = set->replica[0]->part[0].addr;
-	set->poolsize = pop->heap_offset + pop->heap_size;
-
-	if (obj_replicas_init(set))
+	if ((pop = obj_replicas_init(set)) == NULL) {
 		goto replicas_init;
+	}
 
-	for (unsigned r = 0; r < set->nreplicas; r++) {
-		struct pool_replica *repset = set->replica[r];
-		PMEMobjpool *rep = repset->part[0].addr;
+	/*
+	 * Prevent to open the pool twice within the same process
+	 * Until this point the pool file must **not** be written.
+	 */
+	if (pools_ht) {
+		uint64_t uuid_lo = pmemobj_get_uuid_lo(
+			(const PMEMobjpool *)pop->base_addr);
+		const PMEMobjpool *old = cuckoo_get(pools_ht, uuid_lo);
+		if (old && old->uuid_lo == uuid_lo) {
+			errno = EWOULDBLOCK;
+			ERR("!pool already opened");
+			goto err_opened_twice;
+		}
+	}
+
+	pop->pool_desc = (struct pool_descriptor *)((uintptr_t)pop->base_addr
+	    + POOL_HDR_SIZE);
+
+	set->poolsize = pop->pool_desc->heap_offset +
+					pop->pool_desc->heap_size;
+
+	for (PMEMobjpool *rep = pop; rep != NULL; rep = rep->replica) {
 		/* check descriptor */
 		if (obj_descr_check(rep, layout, set->poolsize) != 0) {
-			LOG(2, "descriptor check of replica #%u failed", r);
+			LOG(2, "descriptor check of replica #%p failed", rep);
 			goto err_descr_check;
 		}
 	}
@@ -1641,7 +2841,8 @@ err_runtime_init:
 err_replicas_check_basic:
 err_check_basic:
 err_descr_check:
-	obj_replicas_fini(set);
+err_opened_twice:
+	obj_replicas_fini(pop);
 replicas_init:
 	obj_pool_close(set);
 	return NULL;
@@ -1697,30 +2898,32 @@ pmemobj_openW(const wchar_t *path, const wchar_t *layout)
 }
 #endif
 
+#if 0
+
+#endif
+
 /*
- * obj_replicas_cleanup -- (internal) free resources allocated for replicas
+ * obj_pool_mp_cleanup -- (internal) cleanup or unmap resources used
+ * for multi-process support
  */
 static void
-obj_replicas_cleanup(struct pool_set *set)
+obj_pool_mp_cleanup(PMEMobjpool *pop, int clean_shrd)
 {
-	LOG(3, "set %p", set);
+	LOG(3, "pop %p", pop);
 
-	for (unsigned r = 0; r < set->nreplicas; r++) {
-		struct pool_replica *rep = set->replica[r];
+	if (!pop->mp_mode)
+		return;
 
-		PMEMobjpool *pop = rep->part[0].addr;
-		redo_log_config_delete(pop->redo);
+	/* detach from registry */
+	registry_remove_by_idx(pop->registry, pop->proc_idx);
+	registry_delete(pop->registry, clean_shrd);
 
-		if (pop->rpp != NULL) {
-			/*
-			 * remote replica will be closed in util_poolset_close
-			 */
-			pop->rpp = NULL;
+	/* unmap, cleanup and close shm */
+	obj_shm_cleanup(pop, clean_shrd);
+	(void) os_close(pop->shm_fd);
 
-			Free(pop->node_addr);
-			Free(pop->pool_desc);
-		}
-	}
+	/* close and release held locks */
+	(void) os_close(pop->lock_fd);
 }
 
 /*
@@ -1734,13 +2937,152 @@ obj_pool_cleanup(PMEMobjpool *pop)
 	tx_params_delete(pop->tx_params);
 	ctl_delete(pop->ctl);
 
-	palloc_heap_cleanup(&pop->heap);
+	int clean_shrd = 0;
+	if (pop->mp_mode) {
+		/*
+		 * Try upgrading the shared lock. If successfull, we are the
+		 * only user of the pool and responsible for cleaning up the
+		 * shared transient state.
+		 *
+		 * Since other processes are not able to obtain read access in
+		 * function obj_open_mp_files(), no other process can open the
+		 * pool until we cleaned the shared state.
+		 *
+		 * An alternative implementation could introduced the
+		 * a new initialization_state, e.g., 'SHUTDOWN'.
+		 *
+		 * For locking, we rely on advisory locks. Alternatively we
+		 * could use SysV semaphores. This would allow us to use a
+		 * refcount in conjunction with SEM_UNDO to correctly
+		 * decrement on process crash, but comes of the cost for more
+		 * overhead, complexity and less portability.
+		 */
+		if (util_write_lock(pop->lock_fd, OBJ_LOCK_DMS, SEEK_SET, 1)
+		    == 0) {
+			clean_shrd = 1;
+
+			/*
+			 * we are the last process. while cleaning up we must
+			 * prevent others from attaching
+			 */
+			if (util_write_lock(pop->lock_fd, OBJ_LOCK_POOL,
+			    SEEK_SET, 1))
+				FATAL("!util_write_lock OBJ_LOCK_POOL");
+		}
+
+		/*
+		 * the call to palloc_heap_cleanup releases the region and
+		 * has to happen before the process detaches from the registry
+		 */
+		palloc_heap_cleanup(&pop->heap, clean_shrd);
+		obj_pool_mp_cleanup(pop, clean_shrd);
+	} else {
+		palloc_heap_cleanup(&pop->heap, clean_shrd);
+	}
+
+	/* release locks */
+	if (pop->mp_mode) {
+		if (clean_shrd) {
+			if (!util_un_lock(pop->lock_fd, OBJ_LOCK_POOL,
+			    SEEK_SET, 1))
+				ERR("un_lock OBJ_LOCK_POOL");
+		}
+
+		if (util_un_lock(pop->lock_fd, OBJ_LOCK_DMS, SEEK_SET, 1) != 0)
+			ERR("un_lock OBJ_LOCK_DMS");
+	}
+
+	/* continue cleaning up local state */
 
 	lane_cleanup(pop);
 
-	/* unmap all the replicas */
-	obj_replicas_cleanup(pop->set);
+	/* unmap and free all replicas */
 	util_poolset_close(pop->set, DO_NOT_DELETE_PARTS);
+	obj_replicas_fini(pop);
+}
+
+/*
+ *  sqlite3 style busy handler registration
+ *
+ * This routine sets the busy callback to the
+ * given callback function with the given argument.
+ */
+int obj_register_busy_handler(PMEMobjpool *pop, int (*xBusy)(void *, int),
+	void *pArg) {
+	pop->busy_handler.xFunc = xBusy;
+	pop->busy_handler.pArg = pArg;
+	pop->busy_handler.nBusy = 0;
+	pop->busyTimeout = 0;
+
+	return 0;
+}
+
+/*
+ * obj_env_fini -- (internal) shm cleanup for still open pools (on destructor)
+ */
+static void
+obj_env_fini()
+{
+	PMEMobjpool *pop = NULL;
+	while ((pop = obj_pool_find_opened()) != NULL) {
+		LOG(3, "found open pop %p", pop);
+		if (pop->mp_mode) {
+			obj_pool_cleanup(pop);
+		}
+	}
+}
+
+/*
+ * obj_fini -- cleanup of obj
+ *
+ * Called by destructor.
+ */
+void
+obj_fini(void)
+{
+	LOG(3, NULL);
+
+	obj_env_fini();
+
+	if (pools_ht)
+		cuckoo_delete(pools_ht);
+	if (pools_trans_ht)
+		cuckoo_delete(pools_trans_ht);
+	if (pools_tree)
+		ctree_delete(pools_tree);
+	lane_info_destroy();
+	util_remote_fini();
+}
+
+/*
+ * Slightly modified SQLITE busy handler.
+ *
+ * Invokes the given busy handler.
+ *
+ * This routine is called when an operation failed with a lock.
+ * If this routine returns non-zero, the lock is retried.  If it
+ * returns 0, the operation aborts with an SQLITE_BUSY error.
+ *
+ * The handler will sleep multiple times until at least "ms" milliseconds
+ * of sleeping  have accumulated.  After at least "ms" milliseconds of sleeping,
+ * the handler returns 0.
+ */
+int obj_invoke_busy_handler(struct busy_handler *p) {
+	LOG(4, "handler %p cb %p timeout %d", p, p->xFunc, p->nBusy);
+
+	ASSERT(p != NULL);
+	ASSERT(p->xFunc != NULL);
+	ASSERT(p->nBusy >= 0);
+
+	int rc;
+	rc = p->xFunc(p->pArg, p->nBusy);
+	if (rc == 0) {
+		p->nBusy = -1;
+	} else {
+		p->nBusy++;
+	}
+
+	return rc;
 }
 
 /*
@@ -1757,7 +3099,12 @@ pmemobj_close(PMEMobjpool *pop)
 		ERR("cuckoo_remove");
 	}
 
-	if (ctree_remove(pools_tree, (uint64_t)pop, 1) != (uint64_t)pop) {
+	if (cuckoo_remove(pools_trans_ht, (uint64_t)pop->base_addr) != pop) {
+		ERR("cuckoo_remove");
+	}
+
+	if (ctree_remove(pools_tree, (uint64_t)pop->base_addr, 1) !=
+	    (uint64_t)pop->base_addr) {
 		ERR("ctree_remove");
 	}
 
@@ -1811,6 +3158,24 @@ pmemobj_checkU(const char *path, const char *layout)
 	if (pop->replica == NULL)
 		consistent = obj_check_basic(pop);
 
+	if (consistent) {
+		/* single process init */
+		pop->is_primary = 1;
+
+		/*
+		 * disable mp-mode irrespective of current environment settings.
+		 * This is because due to reduce complexity and has no impact
+		 * on pool consistency.
+		 */
+		pop->mp_mode = 0;
+
+		/* workaround to satisfy lane cleanup */
+		pop->lanes_desc.lane =
+		    Malloc(OBJ_NLANES * sizeof(struct lane));
+		pop->lanes_desc.lane_locks =
+		    Zalloc(OBJ_NLANES * sizeof(uint64_t));
+	}
+
 	if (consistent && (errno = obj_boot(pop)) != 0) {
 		LOG(3, "!obj_boot");
 		consistent = 0;
@@ -1822,9 +3187,11 @@ pmemobj_checkU(const char *path, const char *layout)
 		tx_params_delete(pop->tx_params);
 		ctl_delete(pop->ctl);
 
+		Free(pop->lane_range);
+
 		/* unmap all the replicas */
-		obj_replicas_cleanup(pop->set);
 		util_poolset_close(pop->set, DO_NOT_DELETE_PARTS);
+		obj_replicas_fini(pop);
 	}
 
 	if (consistent)
@@ -1836,6 +3203,9 @@ pmemobj_checkU(const char *path, const char *layout)
 #ifndef _WIN32
 /*
  * pmemobj_check -- transactional memory pool consistency check
+ *
+ * always opens the pool in non-multi processing mode, since this function
+ * should be invoked from a single process only.
  */
 int
 pmemobj_check(const char *path, const char *layout)
@@ -1916,7 +3286,7 @@ pmemobj_pool_by_ptr(const void *addr)
 	if (pool_size <= addr_off)
 		return NULL;
 
-	return (PMEMobjpool *)key;
+	return cuckoo_get(pools_trans_ht, key);
 }
 
 /* arguments for constructor_alloc_bytype */
@@ -1977,13 +3347,13 @@ obj_alloc_construct(PMEMobjpool *pop, PMEMoid *oidp, size_t size,
 	struct redo_log *redo = pmalloc_redo_hold(pop);
 
 	struct operation_context ctx;
-	operation_init(&ctx, pop, pop->redo, redo);
+	operation_init(&ctx, pop->base_addr, pop->redo, redo);
 
 	if (oidp)
 		operation_add_entry(&ctx, &oidp->pool_uuid_lo, pop->uuid_lo,
 				OPERATION_SET);
 
-	int ret = pmalloc_operation(&pop->heap, 0,
+	int ret = pmalloc_operation(pop, 0,
 			oidp != NULL ? &oidp->off : NULL, size,
 			constructor_alloc_bytype, &carg, type_num, 0, &ctx);
 
@@ -2065,7 +3435,7 @@ obj_free(PMEMobjpool *pop, PMEMoid *oidp)
 
 	operation_add_entry(&ctx, &oidp->pool_uuid_lo, 0, OPERATION_SET);
 
-	pmalloc_operation(&pop->heap, oidp->off, &oidp->off, 0, NULL, NULL,
+	pmalloc_operation(pop, oidp->off, &oidp->off, 0, NULL, NULL,
 			0, 0, &ctx);
 
 	pmalloc_redo_release(pop);
@@ -2143,7 +3513,7 @@ obj_realloc_common(PMEMobjpool *pop,
 	struct operation_context ctx;
 	operation_init(&ctx, pop, pop->redo, redo);
 
-	int ret = pmalloc_operation(&pop->heap, oidp->off, &oidp->off,
+	int ret = pmalloc_operation(pop, oidp->off, &oidp->off,
 			size, constructor_realloc, &carg, type_num, 0, &ctx);
 
 	pmalloc_redo_release(pop);
@@ -2453,8 +3823,8 @@ obj_alloc_root(PMEMobjpool *pop, size_t size,
 
 	struct carg_realloc carg;
 
-	carg.ptr = OBJ_OFF_TO_PTR(pop, pop->root_offset);
-	carg.old_size = pop->root_size;
+	carg.ptr = OBJ_OFF_TO_PTR(pop, pop->pool_desc->root_offset);
+	carg.old_size = pop->pool_desc->root_size;
 	carg.new_size = size;
 	carg.user_type = POBJ_ROOT_TYPE_NUM;
 	carg.constructor = constructor;
@@ -2466,10 +3836,11 @@ obj_alloc_root(PMEMobjpool *pop, size_t size,
 	struct operation_context ctx;
 	operation_init(&ctx, pop, pop->redo, redo);
 
-	operation_add_entry(&ctx, &pop->root_size, size, OPERATION_SET);
+	operation_add_entry(&ctx, &pop->pool_desc->root_size, size,
+	    OPERATION_SET);
 
-	int ret = pmalloc_operation(&pop->heap, pop->root_offset,
-			&pop->root_offset, size,
+	int ret = pmalloc_operation(pop, pop->pool_desc->root_offset,
+			&pop->pool_desc->root_offset, size,
 			constructor_zrealloc_root, &carg,
 			POBJ_ROOT_TYPE_NUM, OBJ_INTERNAL_OBJECT_MASK, &ctx);
 
@@ -2486,8 +3857,8 @@ pmemobj_root_size(PMEMobjpool *pop)
 {
 	LOG(3, "pop %p", pop);
 
-	if (pop->root_offset && pop->root_size) {
-		return pop->root_size;
+	if (pop->pool_desc->root_offset && pop->pool_desc->root_size) {
+		return pop->pool_desc->root_size;
 	} else
 		return 0;
 }
@@ -2509,20 +3880,19 @@ pmemobj_root_construct(PMEMobjpool *pop, size_t size,
 	}
 
 	PMEMoid root;
+	pmemobj_mutex_lock_nofail(pop, &pop->pool_desc->rootlock);
 
-	pmemobj_mutex_lock_nofail(pop, &pop->rootlock);
-
-	if (size > pop->root_size &&
+	if (size > pop->pool_desc->root_size &&
 		obj_alloc_root(pop, size, constructor, arg)) {
-		pmemobj_mutex_unlock_nofail(pop, &pop->rootlock);
+		pmemobj_mutex_unlock_nofail(pop, &pop->pool_desc->rootlock);
 		LOG(2, "obj_realloc_root failed");
 		return OID_NULL;
 	}
 
 	root.pool_uuid_lo = pop->uuid_lo;
-	root.off = pop->root_offset;
+	root.off = pop->pool_desc->root_offset;
 
-	pmemobj_mutex_unlock_nofail(pop, &pop->rootlock);
+	pmemobj_mutex_unlock_nofail(pop, &pop->pool_desc->rootlock);
 	return root;
 }
 

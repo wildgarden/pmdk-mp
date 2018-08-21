@@ -95,6 +95,37 @@ os_mutex_init(os_mutex_t *__restrict mutex)
 }
 
 /*
+ * os_mutex_init -- pthread_mutex_init abstraction layer
+ */
+int
+os_mutex_init_mp(os_mutex_t *__restrict mutex)
+{
+	COMPILE_ERROR_ON(sizeof(os_mutex_t) < sizeof(pthread_mutex_t));
+	os_mutexattr_t attr;
+	int err = os_mutexattr_init(&attr);
+	if (err)
+		return err;
+
+	err = os_mutexattr_setpshared(&attr);
+	if (err)
+		return err;
+
+	err = os_mutexattr_setrobust(&attr);
+	if (err)
+		return err;
+
+	err = os_mutex_init_with_attr(mutex, &attr);
+	if (err)
+		return err;
+
+	err = os_mutexattr_destroy(&attr);
+	if (err)
+		return err;
+
+	return 0;
+}
+
+/*
  * os_mutex_destroy -- pthread_mutex_destroy abstraction layer
  */
 int
@@ -270,6 +301,7 @@ os_spin_trylock(os_spinlock_t *lock)
 {
 	return pthread_spin_trylock((pthread_spinlock_t *)lock);
 }
+
 /*
  * os_cond_init -- pthread_cond_init abstraction layer
  */
@@ -278,6 +310,35 @@ os_cond_init(os_cond_t *__restrict cond)
 {
 	COMPILE_ERROR_ON(sizeof(os_cond_t) < sizeof(pthread_cond_t));
 	return pthread_cond_init((pthread_cond_t *)cond, NULL);
+}
+
+/*
+ * os_cond_init_mp -- pthread_cond_init variant that wraps several steps to
+ * build a shared pthread_cond_t
+ *
+ */
+int
+os_cond_init_mp(os_cond_t *__restrict cond)
+{
+	COMPILE_ERROR_ON(sizeof(os_cond_t) < sizeof(pthread_cond_t));
+	os_condattr_t attr;
+	int err = os_condattr_init(&attr);
+	if (err)
+		return err;
+
+	err = os_condattr_setpshared(&attr);
+	if (err)
+		return err;
+
+	err = os_cond_init_with_attr(cond, &attr);
+	if (err)
+		return err;
+
+	err = os_condattr_destroy(&attr);
+	if (err)
+		return err;
+
+	return 0;
 }
 
 /*
@@ -434,4 +495,111 @@ int
 os_semaphore_post(os_semaphore_t *sem)
 {
 	return sem_post((sem_t *)sem);
+}
+
+/* multi-process support */
+
+/*
+ * os_mutexattr_init -- pthread_mutexattr_init abstraction layer
+ */
+int
+os_mutexattr_init(os_mutexattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_mutexattr_t) < sizeof(pthread_mutexattr_t));
+	return pthread_mutexattr_init((pthread_mutexattr_t *)attr);
+}
+
+/*
+ * os_mutexattr_destroy -- pthread_mutexattr_destroy abstraction laer
+ */
+int
+os_mutexattr_destroy(os_mutexattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_mutexattr_t) < sizeof(pthread_mutexattr_t));
+	return pthread_mutexattr_destroy((pthread_mutexattr_t *)attr);
+}
+
+/*
+ * os_mutexattr_setpshared -- pthread_mutexattr_setpshared abstraction layer
+ */
+int
+os_mutexattr_setpshared(os_mutexattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_mutexattr_t) < sizeof(pthread_mutexattr_t));
+	return pthread_mutexattr_setpshared((pthread_mutexattr_t *)attr,
+	    PTHREAD_PROCESS_SHARED);
+}
+
+/*
+ * os_mutexattr_setrobust -- pthread_mutexattr_setrobust abstraction layer
+ */
+int
+os_mutexattr_setrobust(os_mutexattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_mutexattr_t) < sizeof(pthread_mutexattr_t));
+	return pthread_mutexattr_setrobust((pthread_mutexattr_t *)attr,
+	    PTHREAD_MUTEX_ROBUST);
+}
+
+/*
+ * os_mutex_init_with_attr -- pthread_mutex_init abstraction layer that takes an
+ * attribute
+ */
+int
+os_mutex_init_with_attr(os_mutex_t *__restrict mutex, os_mutexattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_mutex_t) < sizeof(pthread_mutex_t));
+	COMPILE_ERROR_ON(sizeof(os_mutexattr_t) < sizeof(pthread_mutexattr_t));
+	return pthread_mutex_init((pthread_mutex_t *)mutex,
+		(pthread_mutexattr_t *)attr);
+}
+
+/*
+ * os_mutex_consistent -- pthread_mutex_consistent abstraction layer
+ */
+int
+os_mutex_consistent(os_mutex_t *m)
+{
+	return pthread_mutex_consistent((pthread_mutex_t *)m);
+}
+
+/*
+ * os_condattr_init -- pthread_condattr_init abstraction layer
+ */
+int os_condattr_init(os_condattr_t *attr) {
+	COMPILE_ERROR_ON(sizeof(os_condattr_t) < sizeof(pthread_condattr_t));
+	return pthread_condattr_init((pthread_condattr_t *)attr);
+}
+
+/*
+ * os_cond_init -- pthread_cond_init abstraction layer
+ */
+int
+os_cond_init_with_attr(os_cond_t *__restrict cond, os_condattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_cond_t) < sizeof(pthread_cond_t));
+	COMPILE_ERROR_ON(sizeof(os_condattr_t) < sizeof(pthread_condattr_t));
+	return pthread_cond_init((pthread_cond_t *)cond,
+		(pthread_condattr_t *)attr);
+}
+
+/*
+ * os_condattr_setpshared -- pthread_condattr_setpshared abstraction layer
+ */
+int
+os_condattr_setpshared(os_condattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_condattr_t) < sizeof(pthread_condattr_t));
+	return pthread_condattr_setpshared((pthread_condattr_t *)attr,
+	    PTHREAD_PROCESS_SHARED);
+}
+
+/*
+ * os_condattr_destroy -- pthread_condattr_destroy abstraction layer
+ */
+int
+os_condattr_destroy(os_condattr_t *attr)
+{
+	COMPILE_ERROR_ON(sizeof(os_condattr_t) < sizeof(pthread_condattr_t));
+	return pthread_condattr_destroy((pthread_condattr_t *)attr);
 }

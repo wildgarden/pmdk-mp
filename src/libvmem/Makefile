@@ -42,6 +42,7 @@ SOURCE = libvmem.c vmem.c\
 	$(COMMON)/mmap_linux.c\
 	$(COMMON)/os_linux.c\
 	$(COMMON)/os_thread_linux.c\
+	$(COMMON)/os_shm.c\
 	$(COMMON)/out.c\
 	$(COMMON)/util_linux.c\
 	$(COMMON)/util.c
@@ -58,5 +59,5 @@ INCS += -I$(JEMALLOC_DIR)/include/jemalloc
 INCS += -I$(JEMALLOC_OBJDIR)/include/jemalloc
 EXTRA_OBJS += $(JEMALLOC_LIB)
 LIBS += -pthread
-
+LIBS += -lrt
 include ../Makefile.inc

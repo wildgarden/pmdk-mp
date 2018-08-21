@@ -178,7 +178,7 @@ pmemlog_createU(const char *path, size_t poolsize, mode_t mode)
 			LOG_HDR_SIG, LOG_FORMAT_MAJOR,
 			LOG_FORMAT_COMPAT, LOG_FORMAT_INCOMPAT,
 			LOG_FORMAT_RO_COMPAT, NULL,
-			REPLICAS_DISABLED) != 0) {
+			REPLICAS_DISABLED, 1 /* flock */) != 0) {
 		LOG(2, "cannot create pool or pool set");
 		return NULL;
 	}

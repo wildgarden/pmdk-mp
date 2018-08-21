@@ -1,0 +1,11 @@
+obj_mp_resilience$(nW)TEST1: START: obj_mp_resilience
+ $(nW)obj_mp_resilience$(nW) $(nW)/test_obj_mp_resilience1$(*)/testfile 1
+[$(N)] wait until child created the pool
+[$(N)] created sync file
+[$(N)] found sync file
+[$(N)] Simulating long lag in next function call (pmemobj_free())
+[$(N)] operation_process() hangs (sleeps) for 15 seconds
+[$(N)] pmalloc() start
+[$(N)] pmalloc() finished
+[$(N)] long running pmemobj_free finished
+obj_mp_resilience/TEST1: DONE

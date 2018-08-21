@@ -25,3 +25,4 @@ nbproject/
 *.hpptmp
 *.aps
 tags
+cmake-build-debug/

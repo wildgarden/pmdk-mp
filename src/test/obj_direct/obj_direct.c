@@ -123,10 +123,10 @@ main(int argc, char *argv[])
 		oids[i] = (PMEMoid) {pops[i]->uuid_lo, 0};
 		UT_ASSERTeq(obj_direct(oids[i]), NULL);
 
-		uint64_t off = pops[i]->heap_offset;
+		uint64_t off = pops[i]->pool_desc->heap_offset;
 		oids[i] = (PMEMoid) {pops[i]->uuid_lo, off};
 		UT_ASSERTeq((char *)obj_direct(oids[i]) - off,
-			(char *)pops[i]);
+			(char *)pops[i]->base_addr);
 
 		r = pmemobj_alloc(pops[i], &tmpoids[i], 100, 1, NULL, NULL);
 		UT_ASSERTeq(r, 0);

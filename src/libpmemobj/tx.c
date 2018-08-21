@@ -249,7 +249,7 @@ constructor_tx_copy(void *ctx, void *ptr, size_t usable_size, void *arg)
 static int
 constructor_tx_add_range(void *ctx, void *ptr, size_t usable_size, void *arg)
 {
-	LOG(3, NULL);
+	LOG(5, NULL);
 	PMEMobjpool *pop = ctx;
 
 	ASSERTne(ptr, NULL);
@@ -352,7 +352,7 @@ static void
 tx_clear_undo_log(PMEMobjpool *pop, struct pvector_context *undo,
 	enum tx_clr_flag flags)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	uint64_t val;
 
@@ -373,7 +373,7 @@ tx_clear_undo_log(PMEMobjpool *pop, struct pvector_context *undo,
 static void
 tx_abort_alloc(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt)
 {
-	LOG(3, NULL);
+	LOG(5, NULL);
 
 	tx_clear_undo_log(pop, tx_rt->ctx[UNDO_ALLOC],
 		TX_CLR_FLAG_FREE |
@@ -387,7 +387,7 @@ tx_abort_alloc(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt)
 static void
 tx_abort_free(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt)
 {
-	LOG(3, NULL);
+	LOG(5, NULL);
 
 	tx_clear_undo_log(pop, tx_rt->ctx[UNDO_FREE], 0);
 }
@@ -517,7 +517,7 @@ static void
 tx_foreach_set(PMEMobjpool *pop, struct tx *tx, struct tx_undo_runtime *tx_rt,
 	void (*cb)(PMEMobjpool *pop, struct tx *tx, struct tx_range *range))
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	struct tx_range *range = NULL;
 	uint64_t off;
@@ -542,7 +542,7 @@ tx_foreach_set(PMEMobjpool *pop, struct tx *tx, struct tx_undo_runtime *tx_rt,
 
 			cb(pop, tx, range);
 
-			size_t amask = pop->conversion_flags &
+			size_t amask = pop->pool_desc->conversion_flags &
 				CONVERSION_FLAG_OLD_SET_CACHE ?
 				TX_RANGE_MASK_LEGACY : TX_RANGE_MASK;
 			cache_offset += TX_ALIGN_SIZE(range->size, amask) +
@@ -583,7 +583,7 @@ static void
 tx_clear_set_cache_but_first(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt,
 	struct tx *tx, enum tx_clr_flag vg_flags)
 {
-	LOG(3, NULL);
+	LOG(4, NULL);
 
 	struct pvector_context *cache_undo = tx_rt->ctx[UNDO_SET_CACHE];
 	uint64_t first_cache = pvector_first(cache_undo);
@@ -636,7 +636,7 @@ tx_clear_set_cache_but_first(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt,
 static void
 tx_abort_set(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt, int recovery)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	struct tx *tx = recovery ? NULL : get_tx();
 
@@ -663,7 +663,7 @@ tx_abort_set(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt, int recovery)
 static void
 tx_post_commit_alloc(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	tx_clear_undo_log(pop, tx_rt->ctx[UNDO_ALLOC],
 			TX_CLR_FLAG_VG_TX_REMOVE);
@@ -676,7 +676,7 @@ tx_post_commit_alloc(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt)
 static void
 tx_post_commit_free(PMEMobjpool *pop, struct tx_undo_runtime *tx_rt)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	tx_clear_undo_log(pop, tx_rt->ctx[UNDO_FREE],
 		TX_CLR_FLAG_FREE | TX_CLR_FLAG_VG_TX_REMOVE);
@@ -704,7 +704,7 @@ static void
 tx_post_commit_set(PMEMobjpool *pop, struct tx *tx,
 		struct tx_undo_runtime *tx_rt, int recovery)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 #ifdef USE_VG_PMEMCHECK
 	if (On_valgrind)
@@ -740,7 +740,7 @@ tx_flush_range(uint64_t offset, uint64_t size_flags, void *ctx)
 static void
 tx_pre_commit(PMEMobjpool *pop, struct tx *tx, struct lane_tx_runtime *lane)
 {
-	LOG(3, NULL);
+	LOG(5, NULL);
 
 	ASSERTne(tx->section->runtime, NULL);
 
@@ -756,7 +756,7 @@ static int
 tx_rebuild_undo_runtime(PMEMobjpool *pop, struct lane_tx_layout *layout,
 	struct tx_undo_runtime *tx_rt)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	int i;
 	for (i = UNDO_ALLOC; i < MAX_UNDO_TYPES; ++i) {
@@ -784,7 +784,7 @@ error_init:
 static void
 tx_destroy_undo_runtime(struct tx_undo_runtime *tx)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	for (int i = UNDO_ALLOC; i < MAX_UNDO_TYPES; ++i)
 		pvector_delete(tx->ctx[i]);
@@ -797,7 +797,7 @@ static void
 tx_post_commit(PMEMobjpool *pop, struct tx *tx, struct lane_tx_layout *layout,
 		int recovery)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	struct tx_undo_runtime *tx_rt;
 	struct tx_undo_runtime new_rt = { .ctx = {NULL, } };
@@ -833,7 +833,7 @@ tx_abort_register_valgrind(PMEMobjpool *pop, struct pvector_context *ctx)
 		 * Can't use pmemobj_direct and pmemobj_alloc_usable_size
 		 * because pool has not been registered yet.
 		 */
-		void *p = (char *)pop + off;
+		void *p = (char *)pop->base_addr + off;
 		size_t sz = palloc_usable_size(&pop->heap, off);
 
 		VALGRIND_DO_MEMPOOL_ALLOC(pop->heap.layout, p, sz);
@@ -849,7 +849,7 @@ static void
 tx_abort(PMEMobjpool *pop, struct lane_tx_runtime *lane,
 		struct lane_tx_layout *layout, int recovery)
 {
-	LOG(3, NULL);
+	LOG(7, NULL);
 
 	struct tx_undo_runtime *tx_rt;
 	struct tx_undo_runtime new_rt = { .ctx = {NULL, } };
@@ -917,8 +917,24 @@ add_to_tx_and_lock(struct tx *tx, enum pobj_tx_param type, void *lock)
 	switch (txl->lock_type) {
 		case TX_PARAM_MUTEX:
 			txl->lock.mutex = lock;
-			retval = pmemobj_mutex_lock(tx->pop,
-				txl->lock.mutex);
+
+			if ((retval = tx->pop->pmem_lock(tx->pop,
+				txl->lock.mutex)) == EOWNERDEAD &&
+			    (obj_crash_check_and_recover(tx->pop) == 0)) {
+				pmemobj_mutex_consistent(tx->pop,
+					txl->lock.mutex);
+				tx->pop->pmem_unlock(tx->pop, txl->lock.mutex);
+
+				/*
+				 * XXX mp-mode
+				 * we should consider to return EOWNERDEAD
+				 * instead, to signal the user what happened
+				 * internally. Anyway the transaction should
+				 * be canceled and retried.
+				 */
+				retval = ECANCELED;
+			}
+
 			if (retval) {
 				errno = retval;
 				ERR("!pmemobj_mutex_lock");
@@ -926,6 +942,9 @@ add_to_tx_and_lock(struct tx *tx, enum pobj_tx_param type, void *lock)
 			break;
 		case TX_PARAM_RWLOCK:
 			txl->lock.rwlock = lock;
+			/*
+			 * XXX mp-mode -- shared variant must be used in mp-mode
+			 */
 			retval = pmemobj_rwlock_wrlock(tx->pop,
 				txl->lock.rwlock);
 			if (retval) {
@@ -958,10 +977,14 @@ release_and_free_tx_locks(struct tx *tx)
 		SLIST_REMOVE_HEAD(&tx->tx_locks, tx_lock);
 		switch (tx_lock->lock_type) {
 			case TX_PARAM_MUTEX:
-				pmemobj_mutex_unlock(tx->pop,
+				tx->pop->pmem_unlock(tx->pop,
 					tx_lock->lock.mutex);
 				break;
 			case TX_PARAM_RWLOCK:
+				/*
+				 * XXX mp-mode -- shared variant must be used
+				 * in mp-mode
+				 */
 				pmemobj_rwlock_unlock(tx->pop,
 					tx_lock->lock.rwlock);
 				break;
@@ -1537,7 +1560,7 @@ pmemobj_tx_end(void)
 void
 pmemobj_tx_process(void)
 {
-	LOG(3, NULL);
+	LOG(5, NULL);
 	struct tx *tx = get_tx();
 
 	ASSERT_IN_TX(tx);
@@ -1594,7 +1617,7 @@ pmemobj_tx_add_large(struct tx *tx, struct tx_add_range_args *args)
 static int
 constructor_tx_range_cache(void *ctx, void *ptr, size_t usable_size, void *arg)
 {
-	LOG(3, NULL);
+	LOG(5, NULL);
 	PMEMobjpool *pop = ctx;
 	const struct pmem_ops *p_ops = &pop->p_ops;
 
@@ -1736,9 +1759,10 @@ pmemobj_tx_add_common(struct tx *tx, struct tx_add_range_args *args)
 		return obj_tx_abort_err(EINVAL);
 	}
 
-	if (args->offset < args->pop->heap_offset ||
-		(args->offset + args->size) >
-		(args->pop->heap_offset + args->pop->heap_size)) {
+	if (args->offset < args->pop->pool_desc->heap_offset ||
+		    (args->offset + args->size) >
+		    (args->pop->pool_desc->heap_offset +
+		    args->pop->pool_desc->heap_size)) {
 		ERR("object outside of heap");
 		return obj_tx_abort_err(EINVAL);
 	}
@@ -1830,15 +1854,15 @@ pmemobj_tx_add_range_direct(const void *ptr, size_t size)
 
 	PMEMobjpool *pop = tx->pop;
 
-	if ((char *)ptr < (char *)pop ||
-			(char *)ptr >= (char *)pop + pop->size) {
+	if ((char *)ptr < (char *)pop->base_addr ||
+			(char *)ptr >= (char *)pop->base_addr + pop->size) {
 		ERR("object outside of pool");
 		return obj_tx_abort_err(EINVAL);
 	}
 
 	struct tx_add_range_args args = {
 		.pop = pop,
-		.offset = (uint64_t)((char *)ptr - (char *)pop),
+		.offset = (uint64_t)((char *)ptr - (char *)pop->base_addr),
 		.size = size,
 		.flags = 0,
 	};
@@ -1871,7 +1895,7 @@ pmemobj_tx_xadd_range_direct(const void *ptr, size_t size, uint64_t flags)
 
 	struct tx_add_range_args args = {
 		.pop = tx->pop,
-		.offset = (uint64_t)((char *)ptr - (char *)tx->pop),
+		.offset = (uint64_t)((char *)ptr - (char *)tx->pop->base_addr),
 		.size = size,
 		.flags = flags,
 	};

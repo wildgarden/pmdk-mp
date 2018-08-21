@@ -34,3 +34,4 @@
 # src/test/pmemspoil/Makefile -- build pmemspoil unittest
 #
 include ../Makefile.inc
+LIBS += -lrt

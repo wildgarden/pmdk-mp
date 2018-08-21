@@ -105,11 +105,13 @@ main(int argc, char *argv[])
 	UT_ASSERTeq(pmemobj_pool_by_ptr(NULL), NULL);
 	UT_ASSERTeq(pmemobj_pool_by_ptr((void *)0xCBA), NULL);
 
+	void *base;
 	for (int i = 0; i < npools; ++i) {
-		void *before_pool = (char *)pops[i] - 1;
-		void *after_pool = (char *)pops[i] + PMEMOBJ_MIN_POOL + 1;
-		void *edge = (char *)pops[i] + PMEMOBJ_MIN_POOL;
-		void *middle = (char *)pops[i] + (PMEMOBJ_MIN_POOL / 2);
+		base = pmemobj_get_base_addr(pops[i]);
+		void *before_pool = (char *)base - 1;
+		void *after_pool = (char *)base + PMEMOBJ_MIN_POOL + 1;
+		void *edge = (char *)base + PMEMOBJ_MIN_POOL;
+		void *middle = (char *)base + (PMEMOBJ_MIN_POOL / 2);
 		void *in_oid = (char *)pmemobj_direct(oids[i]) +
 			(ALLOC_SIZE / 2);
 		UT_ASSERTeq(pmemobj_pool_by_ptr(before_pool), NULL);

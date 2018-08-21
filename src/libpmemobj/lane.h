@@ -100,7 +100,14 @@ struct lane_descriptor {
 	 * other resources e.g. available RNIC's submission queue sizes.
 	 */
 	unsigned runtime_nlanes;
+
+	/*
+	 * XXX mp-mode
+	 * has to be shared once dynamic/shared lane assignment is used
+	 */
 	unsigned next_lane_idx;
+
+	/* shared memory */
 	uint64_t *lane_locks;
 	struct lane *lane;
 };
@@ -134,6 +141,11 @@ struct lane_info {
 	struct lane_info *prev, *next;
 };
 
+struct lane_range {
+    unsigned idx_start;
+    unsigned idx_end;
+};
+
 extern struct section_operations *Section_ops[MAX_LANE_SECTION];
 
 void lane_info_boot(void);
@@ -141,7 +153,10 @@ void lane_info_destroy(void);
 
 int lane_boot(PMEMobjpool *pop);
 void lane_cleanup(PMEMobjpool *pop);
+void lane_destroy(PMEMobjpool *pop, struct lane *lane);
 int lane_recover_and_section_boot(PMEMobjpool *pop);
+int lane_recover(PMEMobjpool *pop, struct lane_range *lrange);
+int lane_section_boot(PMEMobjpool *pop);
 int lane_check(PMEMobjpool *pop);
 
 unsigned lane_hold(PMEMobjpool *pop, struct lane_section **section,
@@ -150,6 +165,9 @@ void lane_release(PMEMobjpool *pop);
 
 void lane_attach(PMEMobjpool *pop, unsigned lane);
 unsigned lane_detach(PMEMobjpool *pop);
+struct lane_range *lane_range_new(void);
+void lane_range_delete(struct lane_range *r);
+
 
 #ifndef _MSC_VER
 

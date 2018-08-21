@@ -90,9 +90,16 @@ OBJ_TESTS = \
 	obj_list_remove\
 	obj_list_valgrind\
 	obj_list_macro\
+	obj_shm_list\
 	obj_locks\
 	obj_memblock\
 	obj_memcheck\
+	obj_mp_basic_integration\
+	obj_mp_swmr\
+	obj_mp_mwmr\
+	obj_mp_pool_lock\
+	obj_mp_pmalloc_mt\
+	obj_mp_resilience\
 	obj_out_of_memory\
 	obj_persist_count\
 	obj_pmalloc_basic\
@@ -125,6 +132,24 @@ OBJ_TESTS = \
 	obj_constructor\
 	obj_oid\
 	obj_zones
+
+OBJ_EXCLUDED_TESTS = \
+	obj_convert\
+	obj_ctl_prefault\
+	obj_heap_state\
+	obj_out_of_memory\
+	obj_persist_count\
+	obj_pool\
+	obj_pmalloc_rand_mt\
+	obj_recreate\
+	obj_constructor
+# obj_constructor TEST0, TEST2 pass, but TEST3 runs into timeoir
+
+OTHER_EXCLUDED_TESTS = \
+	arch_flags\
+	pmemobjcli\
+	pmemspoil\
+	set_funcs\
 
 OBJ_REMOTE_TESTS = \
 	obj_rpmem_basic_integration\
@@ -318,6 +343,12 @@ REMOTE_TESTS = \
 	pmempool_transform_remote\
 	libpmempool_rm_remote
 
+OBJ_MP_TESTS = \
+	$(filter-out $(OTHER_EXCLUDED_TESTS),$(OTHER_TESTS))\
+	$(filter-out $(OBJ_EXCLUDED_TESTS),$(OBJ_TESTS))\
+	$(PMEM_TESTS)
+#	$(EXAMPLES_TESTS)\
+
 ifeq ($(filter n,$(call check_cxx_flags, -std=c++11) $(call check_clang_template_bug)),)
 LOCAL_TESTS += $(OBJ_CPP_TESTS)
 
@@ -397,6 +428,10 @@ check: test
 
 check-remote-quiet: sync-remotes
 	@./RUNTESTS $(RUNTEST_OPTIONS) $(REMOTE_TESTS) MAKEFLAGS="$MAKEFLAGS"
+
+check-obj_mp: test
+	@./RUNTESTS $(RUNTEST_OPTIONS) $(OBJ_MP_TESTS)
+	@echo "No failures."
 
 sync-remotes: test
 

@@ -42,18 +42,25 @@
 
 #include "memops.h"
 #include "redo.h"
-
-struct palloc_heap {
-	struct pmem_ops p_ops;
-	struct heap_layout *layout;
-	struct heap_rt *rt;
-	uint64_t size;
-	uint64_t run_id;
-
-	void *base;
-};
+#include "os_thread.h"
+#include "registry.h"
 
 struct memory_block;
+struct bucket;
+struct pmemobjpool;
+
+struct palloc_heap {
+    struct pmem_ops p_ops;
+    struct heap_layout *layout;
+    struct heap_rt *rt;
+    uint64_t size;
+    uint64_t run_id;
+    unsigned mp_mode;
+
+    void *base;
+    struct pmemobjpool *pop;
+    unsigned proc_idx;
+};
 
 typedef int (*palloc_constr)(void *base, void *ptr,
 		size_t usable_size, void *arg);
@@ -71,7 +78,11 @@ uint64_t palloc_extra(struct palloc_heap *heap, uint64_t off);
 uint16_t palloc_flags(struct palloc_heap *heap, uint64_t off);
 
 int palloc_boot(struct palloc_heap *heap, void *heap_start, uint64_t run_id,
-		uint64_t heap_size, void *base, struct pmem_ops *p_ops);
+    uint64_t heap_size, void *base, struct pmem_ops *p_ops,
+    struct pmemobjpool *pop, int is_primary, unsigned proc_idx);
+int palloc_boot_env(struct palloc_heap *heap, void *shm_start,
+	size_t shm_size, struct registry *registry, int init);
+
 int palloc_buckets_init(struct palloc_heap *heap);
 
 int palloc_init(void *heap_start, uint64_t heap_size, struct pmem_ops *p_ops);
@@ -79,7 +90,9 @@ void *palloc_heap_end(struct palloc_heap *h);
 int palloc_heap_check(void *heap_start, uint64_t heap_size);
 int palloc_heap_check_remote(void *heap_start, uint64_t heap_size,
 		struct remote_ops *ops);
-void palloc_heap_cleanup(struct palloc_heap *heap);
+void palloc_heap_cleanup(struct palloc_heap *heap, int clean_shrd);
+
+void palloc_region_reset(struct palloc_heap *heap, unsigned idx);
 
 /* foreach callback, terminates iteration if return value is non-zero */
 typedef int (*object_callback)(const struct memory_block *m, void *arg);

@@ -52,6 +52,12 @@ typedef union {
 
 typedef union {
 	long long align;
+	char padding[44]; /* linux: 4 windows: ? */
+} os_mutexattr_t;
+
+
+typedef union {
+	long long align;
 	char padding[56]; /* linux: 56 windows: 13 */
 } os_rwlock_t;
 
@@ -59,6 +65,11 @@ typedef union {
 	long long align;
 	char padding[48]; /* linux: 48 windows: 12 */
 } os_cond_t;
+
+typedef union {
+	long long align;
+	char padding[44]; /* linux: 4 windows: ? */
+} os_condattr_t;
 
 typedef uintptr_t os_thread_t;
 typedef long long os_once_t; /* long on linux */
@@ -158,6 +169,24 @@ int os_semaphore_destroy(os_semaphore_t *sem);
 int os_semaphore_wait(os_semaphore_t *sem);
 int os_semaphore_trywait(os_semaphore_t *sem);
 int os_semaphore_post(os_semaphore_t *sem);
+
+/* multi process support */
+int os_mutex_init_mp(os_mutex_t *__restrict mutex);
+int os_mutex_init_with_attr(os_mutex_t *__restrict mutex, os_mutexattr_t *attr);
+
+int os_mutexattr_init(os_mutexattr_t *attr);
+int os_mutexattr_destroy(os_mutexattr_t *attr);
+int os_mutexattr_setpshared(os_mutexattr_t *attr);
+int os_mutexattr_setrobust(os_mutexattr_t *attr);
+
+int os_mutex_consistent(os_mutex_t *m);
+
+int os_condattr_init(os_condattr_t *attr);
+int os_condattr_setpshared(os_condattr_t *attr);
+int os_condattr_destroy(os_condattr_t *attr);
+
+int os_cond_init_mp(os_cond_t *__restrict cond);
+int os_cond_init_with_attr(os_cond_t *__restrict cond, os_condattr_t *attr);
 
 #ifdef __cplusplus
 }

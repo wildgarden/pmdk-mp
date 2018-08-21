@@ -1,0 +1,41 @@
+#README for obj_zones
+
+The expected allocations were changed due to the following reasons:
+
+## original implemenation
+expected 508 allocations.
+The test creates a file with 64G.
+
+This translates to
+64 * 1024 * 1024 * 1024 = 67108864 kb.
+A chunk has 256kb.
+
+Thus, we have 262144 total chunks.
+MAX_CHUNK per zone is 65528 chunks.
+
+We have a total of 4.0005 zones.
+
+We allocate 128mb == 131072 kb.
+131072 / 256 = 512 chunks.
+
+Allocated by obj are 513 units(chunks).
+
+Thus, we have 65528 / 513 = 127.7349 possible allocations per zone.
+
+127 * 4 (Zones) = 508 expected allocations.
+
+## multiprocess support with regions
+65528 / 16 (regions) = 4095.5 chunks per region.
+
+4095/513 (chunks per allocation) = 7.9834
+
+This results in 7 * 16 = 112 possible allocations of size 128mb.
+
+112 * 4 (zones) = 448 expected allocations.
+
+The difference is not lost, because it can still be used for allocations with smaller size.
+
+Note: the max allocation size per zone is 4095 * 256 kb = 1048320 kb = 1023.75 mb
+
+
+

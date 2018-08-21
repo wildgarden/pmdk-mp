@@ -193,10 +193,10 @@ run_worker(void *(worker_func)(void *arg), struct worker_args args[])
 	os_thread_t t[THREADS];
 
 	for (int i = 0; i < THREADS; ++i)
-		os_thread_create(&t[i], NULL, worker_func, &args[i]);
+		PTHREAD_CREATE(&t[i], NULL, worker_func, &args[i]);
 
 	for (int i = 0; i < THREADS; ++i)
-		os_thread_join(t[i], NULL);
+		PTHREAD_JOIN(t[i], NULL);
 }
 
 int

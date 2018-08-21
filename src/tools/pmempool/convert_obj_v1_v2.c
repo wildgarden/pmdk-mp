@@ -91,6 +91,7 @@ struct pmemobjpool {
 	uint64_t nlanes;
 	uint64_t heap_offset;
 	uint64_t heap_size;
+	void *base_addr;
 	/* the rest is irrelevant */
 };
 
@@ -292,7 +293,7 @@ struct heap_layout {
 static void *
 pmemobj_direct(PMEMoid oid)
 {
-	return (char *)pop + oid.off;
+	return (char *)pop->base_addr + oid.off;
 }
 
 static size_t
@@ -320,7 +321,7 @@ redo_recover(struct redo_log *redo, size_t nentries)
 
 	uint64_t *val;
 	while ((redo->offset & REDO_FINISH_FLAG) == 0) {
-		val = (uint64_t *)((uintptr_t)pop + redo->offset);
+		val = (uint64_t *)((uintptr_t)pop->base_addr + redo->offset);
 		*val = redo->value;
 		pmempool_convert_persist(poolset, val, sizeof(uint64_t));
 
@@ -328,7 +329,7 @@ redo_recover(struct redo_log *redo, size_t nentries)
 	}
 
 	uint64_t offset = redo->offset & REDO_FLAG_MASK;
-	val = (uint64_t *)((uintptr_t)pop + offset);
+	val = (uint64_t *)((uintptr_t)pop->base_addr + offset);
 	*val = redo->value;
 	pmempool_convert_persist(poolset, val, sizeof(uint64_t));
 }
@@ -427,7 +428,7 @@ foreach_clear_undo_list(struct list_head *head,
 static void
 restore_range(struct tx_range *r)
 {
-	void *dest = (char *)pop + r->offset;
+	void *dest = (char *)pop->base_addr + r->offset;
 	memcpy(dest, r->data, r->size);
 	pmempool_convert_persist(poolset, dest, r->size);
 }

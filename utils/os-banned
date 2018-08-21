@@ -9,6 +9,8 @@ pthread_mutex_lock
 pthread_mutex_trylock
 pthread_mutex_unlock
 pthread_mutex_timedlock
+pthread_mutexattr_init
+pthread_mutexattr_setpshared
 pthread_rwlock_init
 pthread_rwlock_destroy
 pthread_rwlock_rdlock

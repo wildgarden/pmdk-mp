@@ -297,3 +297,9 @@ redo_get_pmem_ops(const struct redo_ctx *ctx)
 {
 	return &ctx->p_ops;
 }
+
+void *
+redo_get_base_addr(const struct redo_ctx *ctx)
+{
+	return ctx->base;
+}

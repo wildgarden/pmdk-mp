@@ -72,7 +72,7 @@ alloc_prep_block(struct palloc_heap *heap, const struct memory_block *m,
 
 	int ret;
 	if (constructor != NULL &&
-		(ret = constructor(heap->base, uptr, usize, arg)) != 0) {
+		(ret = constructor(heap->pop, uptr, usize, arg)) != 0) {
 
 		/*
 		 * If canceled, revert the block back to the free state in vg
@@ -94,6 +94,46 @@ alloc_prep_block(struct palloc_heap *heap, const struct memory_block *m,
 	*offset_value = HEAP_PTR_TO_OFF(heap, uptr);
 
 	return 0;
+}
+
+
+/*
+ * palloc_restore_free_chunk_state -- updates the runtime state of a free chunk.
+ *
+ * This function also takes care of coalescing of huge chunks.
+ */
+static void
+palloc_restore_free_chunk_state(struct palloc_heap *heap,
+	struct memory_block *m)
+{
+	if (m->type == MEMORY_BLOCK_HUGE) {
+		struct bucket *b =
+			heap_bucket_acquire_by_id(heap,	DEFAULT_ALLOC_CLASS_ID);
+
+		heap_region_trans_lock_shrd(heap);
+
+		if (heap->mp_mode == 0 ||
+		    heap_memblock_from_act_region(m)) {
+			heap_free_chunk_reuse(heap, b, m);
+		}
+
+		heap_region_trans_release(heap);
+		heap_bucket_release(heap, b);
+	}
+}
+
+
+/*
+ * palloc_heap_action_on_unlock -- performs finalization steps that need to be
+ *	performed without a lock on persistent state
+ */
+static void
+palloc_heap_action_on_unlock(struct palloc_heap *heap,
+	struct memory_block *m, int state)
+{
+	if (state == MEMBLOCK_FREE) {
+		palloc_restore_free_chunk_state(heap, m);
+	}
 }
 
 /*
@@ -127,7 +167,7 @@ alloc_prep_block(struct palloc_heap *heap, const struct memory_block *m,
  * return the memory block to the transient container. That is done once no more
  * memory is available.
  *
- * Reallocation is a combination of the above, which one additional step
+ * Reallocation is a combination of the above, with one additional step
  * of copying the old content in the meantime.
  */
 int
@@ -141,9 +181,9 @@ palloc_operation(struct palloc_heap *heap,
 	struct memory_block new_block = MEMORY_BLOCK_NONE;
 	struct memory_block coalesced_block = MEMORY_BLOCK_NONE;
 
-	struct bucket *existing_bucket = NULL;
 	struct bucket *new_bucket = NULL;
 	int ret = 0;
+	int state = MEMBLOCK_STATE_UNKNOWN;
 
 	/*
 	 * The offset value which is to be written to the destination pointer
@@ -167,9 +207,9 @@ palloc_operation(struct palloc_heap *heap,
 	if (size != 0) {
 		struct alloc_class *c = heap_get_best_class(heap, size);
 		if (c == NULL) {
-			errno = EINVAL; /* missing aclass for that size */
-			ret = -1;
-			goto out;
+			ERR("no allocation class for size %lu bytes", size);
+			errno = EINVAL;
+			return -1;
 		}
 
 		/*
@@ -179,7 +219,27 @@ palloc_operation(struct palloc_heap *heap,
 		 * on the run during the heap_get_bestfit_block method which
 		 * means the run will become available to others.
 		 */
-		new_bucket = heap_bucket_acquire(heap, c);
+		if ((new_bucket = heap_bucket_acquire(heap, c)) == NULL) {
+			ret = -1;
+			goto err_bucket;
+		}
+
+		/*
+		 * We hold a shared lock during our operation to prevents other
+		 * threads from changing the active region.
+		 *
+		 * This must _not_ be done before a bucket is aquired.
+		 * Otherwise it can happen that two threads t1 and t2 aquire
+		 * the same bucket, i.e. t2 has to wait on t1 and as a
+		 * consequence won't release the shared lock. When t2 is
+		 * wants to change the active region, it will wait forever.
+		 *
+		 * In case that we aquired and arbitrary bucket and later
+		 * need to refill it, we have to drop the lock prior to
+		 * aquiring the default bucket for similar reasons as stated
+		 * above.
+		 */
+		heap_region_trans_lock_shrd(heap);
 
 		/*
 		 * The caller provided size in bytes, but buckets operate in
@@ -194,8 +254,9 @@ palloc_operation(struct palloc_heap *heap,
 
 		errno = heap_get_bestfit_block(heap, new_bucket, &new_block);
 		if (errno != 0) {
+			LOG(4, "!heap_get_bestfit_block error");
 			ret = -1;
-			goto out;
+			goto err;
 		}
 
 		/*
@@ -214,18 +275,28 @@ palloc_operation(struct palloc_heap *heap,
 			 * the memory block reservation has to be rolled back.
 			 */
 			if (new_block.type == MEMORY_BLOCK_HUGE) {
-				new_block = heap_coalesce_huge(
-					heap, new_bucket, &new_block);
+				new_block = heap_coalesce_huge(heap,
+					new_bucket, &new_block,
+					heap_get_active_region(heap));
 				new_block.m_ops->prep_hdr(&new_block,
 					MEMBLOCK_FREE, ctx);
 				operation_process(ctx);
-				bucket_insert_block(new_bucket, &new_block);
+				if (heap_memblock_from_act_region(&new_block))
+					bucket_insert_block(new_bucket,
+					    &new_block);
 			}
 
 			errno = ECANCELED;
 			ret = -1;
-			goto out;
+			goto err;
 		}
+	} else {
+		/*
+		 * We hold a shared lock during our operation to prevents other
+		 * threads from changing the active regions which result in
+		 * changes of our volatile state.
+		 */
+		heap_region_trans_lock_shrd(heap);
 	}
 
 	/*
@@ -261,27 +332,13 @@ palloc_operation(struct palloc_heap *heap,
 		}
 
 		coalesced_block = existing_block;
-		if (existing_block.type == MEMORY_BLOCK_HUGE) {
-			if (new_bucket && new_bucket->aclass->id ==
-						DEFAULT_ALLOC_CLASS_ID) {
-				existing_bucket = new_bucket;
-				new_bucket = NULL;
-			} else {
-				existing_bucket =
-					heap_bucket_acquire_by_id(heap,
-						DEFAULT_ALLOC_CLASS_ID);
-			}
-
-			coalesced_block = heap_coalesce_huge(heap,
-				existing_bucket, &existing_block);
-		}
 	}
 
 	/*
-	 * These two lock are responsible for protecting the metadata for the
+	 * These two locks are responsible for protecting the metadata for the
 	 * persistent representation of a chunk. Depending on the operation and
 	 * the type of a chunk, they might be NULL.
-	 * These lock must be held for the duration between the creation of the
+	 * These locks must be held for the duration between the creation of the
 	 * allocation metadata updates in the operation context and the
 	 * operation processing. This is because a different thread might
 	 * operate on the same 8-byte value of the run bitmap and override
@@ -315,8 +372,38 @@ palloc_operation(struct palloc_heap *heap,
 		}
 	}
 
-	for (int i = 0; i < nlocks; ++i)
-		util_mutex_lock(locks[i]);
+	for (int i = 0; i < nlocks; ++i) {
+		errno = heap_mutex_lock(heap, locks[i]);
+		switch (errno) {
+			case 0:
+				break;
+			case EOWNERDEAD:
+			case ENOTRECOVERABLE:
+			case ETIMEDOUT:
+
+				/*
+				 * heap_mutex_lock() returned an
+				 * error, but  in case of EOWNERDEAD it is only
+				 * informative since recovery was already
+				 * handled.
+				 *
+				 * As consequence:
+				 * Lock i is unlocked and all other
+				 * previous locks need to be unlocked.
+				 */
+				for (int j = 0; j < i; ++j)
+					util_mutex_unlock(locks[i]);
+
+				ret = -1;
+				goto err;
+			default:
+				/* lock0 might be locked */
+				for (int j = 0; j < i; ++j)
+					util_mutex_unlock(locks[i]);
+
+				FATAL("!os_mutex_lock");
+		}
+	}
 
 	if (!MEMORY_BLOCK_IS_NONE(new_block)) {
 #ifdef DEBUG
@@ -355,7 +442,7 @@ palloc_operation(struct palloc_heap *heap,
 		existing_block = coalesced_block;
 		existing_block.m_ops->prep_hdr(&existing_block,
 			MEMBLOCK_FREE, ctx);
-
+		state = MEMBLOCK_FREE;
 	}
 
 	/*
@@ -369,25 +456,17 @@ palloc_operation(struct palloc_heap *heap,
 
 	operation_process(ctx);
 
-	/*
-	 * After the operation succeeded, the persistent state is all in order
-	 * but in some cases it might not be in-sync with the its transient
-	 * representation.
-	 */
-	if (existing_block.type == MEMORY_BLOCK_HUGE) {
-		ASSERTne(existing_bucket, NULL);
-		bucket_insert_block(existing_bucket, &existing_block);
-	}
-
 	for (int i = 0; i < nlocks; ++i)
 		util_mutex_unlock(locks[i]);
-
+err:
 out:
-	if (existing_bucket != NULL)
-		heap_bucket_release(heap, existing_bucket);
+	heap_region_trans_release(heap);
 
+err_bucket:
 	if (new_bucket != NULL)
 		heap_bucket_release(heap, new_bucket);
+
+	palloc_heap_action_on_unlock(heap, &existing_block, state);
 
 	return ret;
 }
@@ -485,9 +564,20 @@ palloc_next(struct palloc_heap *heap, uint64_t off)
  */
 int
 palloc_boot(struct palloc_heap *heap, void *heap_start, uint64_t heap_size,
-		uint64_t run_id, void *base, struct pmem_ops *p_ops)
+    uint64_t run_id, void *base, struct pmem_ops *p_ops,
+    struct pmemobjpool *pop, int is_primary, unsigned proc_idx)
 {
-	return heap_boot(heap, heap_start, heap_size, run_id, base, p_ops);
+	int ret =
+	    heap_boot(heap, heap_start, heap_size, run_id, base, p_ops, pop,
+		is_primary, proc_idx);
+
+	return ret;
+}
+
+int palloc_boot_env(struct palloc_heap *heap, void *shm_start,
+	size_t shm_size, struct registry *registry, int init)
+{
+	return heap_boot_env(heap, shm_start, shm_size, registry, init);
 }
 
 /*
@@ -540,9 +630,19 @@ palloc_heap_check_remote(void *heap_start, uint64_t heap_size,
  * palloc_heap_cleanup -- cleanups the volatile heap state
  */
 void
-palloc_heap_cleanup(struct palloc_heap *heap)
+palloc_heap_cleanup(struct palloc_heap *heap, int clean_shrd)
 {
-	heap_cleanup(heap);
+	heap_cleanup(heap, clean_shrd);
+}
+
+/*
+ * palloc_region_reset -- (internal) releases all aquirerd regions whose
+ * claimant has the given idx
+ */
+void
+palloc_region_reset(struct palloc_heap *heap, unsigned idx)
+{
+	heap_region_reset(heap, idx);
 }
 
 #ifdef USE_VG_MEMCHECK

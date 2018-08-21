@@ -46,7 +46,7 @@ require_test_type medium
 setup
 
 expect_normal_exit $PMEMPOOL$EXESUFFIX create obj $DIR/testfile
-$PMEMSPOIL $DIR/testfile "pmemobj.layout=ERROR"
+$PMEMSPOIL $DIR/testfile "pool_desc.layout=ERROR"
 expect_normal_exit ./obj_check$EXESUFFIX $DIR/testfile
 
 check

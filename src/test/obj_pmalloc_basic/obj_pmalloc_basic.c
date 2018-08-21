@@ -38,6 +38,7 @@
 #include "heap.h"
 #include "obj.h"
 #include "pmalloc.h"
+#include "registry.h"
 #include "unittest.h"
 #include "valgrind_internal.h"
 
@@ -53,7 +54,8 @@
 #define MALLOC_FREE_SIZE 8000
 
 struct mock_pop {
-	PMEMobjpool p;
+	PMEMobjpool *p;
+	char padding_persistent[8192 - 8]; /* to comply with PM mapping */
 	char lanes[LANE_SECTION_LEN * MAX_LANE_SECTION];
 	char padding[1024]; /* to page boundary */
 	uint64_t ptr;
@@ -117,6 +119,20 @@ obj_memset(void *ctx, void *ptr, int c, size_t sz)
 	memset(ptr, c, sz);
 	UT_ASSERTeq(pmem_msync(ptr, sz), 0);
 	return ptr;
+}
+
+/*
+ * obj_mutex_timedlock_mp -- wraps pmemobj_mutex_timedlock_mp
+ * to pass in a default timeout
+ */
+static int
+obj_mutex_timedlock_mp(PMEMobjpool *pop, PMEMmutex *__restrict mutexp)
+{
+	struct timespec ts;
+	os_clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += OBJ_SHM_MTX_TIMEOUT;
+
+	return pmemobj_mutex_timedlock_mp(pop, mutexp, &ts);
 }
 
 static void
@@ -225,20 +241,38 @@ test_pmalloc_first_next(PMEMobjpool *pop)
 		pfree(pop, &vals[i]);
 }
 
+/*
+ * obj_check_liveliness_and_recover -- obj_crash_check_and_recover mock
+ *
+ * Prevent check for crashed processes and their recovery.
+ */
+FUNC_MOCK_RET_ALWAYS(obj_crash_check_and_recover, int, 1,
+	PMEMobjpool *pop);
+
+#define SIZE_OF_HEAP_RT_SHM (OBJ_SHM_HEAP_SIZE)
+
 static void
 test_mock_pool_allocs(void)
 {
 	addr = MMAP_ANON_ALIGNED(MOCK_POOL_SIZE, Ut_mmap_align);
-	mock_pop = &addr->p;
+	addr->p = pmemobjpool_new();
+	mock_pop = addr->p;
+
 	mock_pop->addr = addr;
+	mock_pop->base_addr = addr;
 	mock_pop->size = MOCK_POOL_SIZE;
 	mock_pop->rdonly = 0;
 	mock_pop->is_pmem = 0;
-	mock_pop->heap_offset = offsetof(struct mock_pop, ptr);
-	UT_ASSERTeq(mock_pop->heap_offset % Ut_pagesize, 0);
-	mock_pop->heap_size = MOCK_POOL_SIZE - mock_pop->heap_offset;
-	mock_pop->nlanes = 1;
-	mock_pop->lanes_offset = sizeof(PMEMobjpool);
+	mock_pop->is_primary = 1;
+	mock_pop->pool_desc = (void *)((uintptr_t)mock_pop->base_addr +
+							    POOL_HDR_SIZE);
+	/* change to offset after lanes ?  */
+	mock_pop->pool_desc->heap_offset = offsetof(struct mock_pop, ptr);
+	UT_ASSERTeq(mock_pop->pool_desc->heap_offset % Ut_pagesize, 0);
+	mock_pop->pool_desc->heap_size = MOCK_POOL_SIZE -
+	    mock_pop->pool_desc->heap_offset;
+	mock_pop->pool_desc->nlanes = 1;
+	mock_pop->pool_desc->lanes_offset = OBJ_LANES_OFFSET;
 	mock_pop->is_master_replica = 1;
 
 	mock_pop->persist_local = (persist_local_fn)pmem_msync;
@@ -251,21 +285,53 @@ test_mock_pool_allocs(void)
 	mock_pop->p_ops.memcpy_persist = obj_memcpy;
 	mock_pop->p_ops.memset_persist = obj_memset;
 	mock_pop->p_ops.base = mock_pop;
+	mock_pop->p_ops.base_p = mock_pop->base_addr;
 	mock_pop->p_ops.pool_size = mock_pop->size;
 
-	mock_pop->redo = redo_log_config_new(addr, &mock_pop->p_ops,
-			redo_log_check_offset, mock_pop, REDO_NUM_ENTRIES);
+	mock_pop->redo = redo_log_config_new(mock_pop->base_addr,
+	    &mock_pop->p_ops, redo_log_check_offset, mock_pop,
+	    REDO_NUM_ENTRIES);
 
-	void *heap_start = (char *)mock_pop + mock_pop->heap_offset;
-	uint64_t heap_size = mock_pop->heap_size;
+	mock_pop->heap.mp_mode = mock_pop->mp_mode;
+
+	void *heap_start = (char *)mock_pop->base_addr +
+	    mock_pop->pool_desc->heap_offset;
+	uint64_t heap_size = mock_pop->pool_desc->heap_size;
 
 	heap_init(heap_start, heap_size, &mock_pop->p_ops);
 	heap_boot(&mock_pop->heap, heap_start, heap_size, MOCK_RUN_ID, mock_pop,
-			&mock_pop->p_ops);
+	    &mock_pop->p_ops, mock_pop, 1, 0);
+
+	void *shm_rt;
+	void *registry_shm_mock;
+	struct registry *mock_registry;
+	if (mock_pop->mp_mode) {
+		mock_pop->pmem_lock = obj_mutex_timedlock_mp;
+		mock_pop->pmem_unlock = pmemobj_mutex_unlock_mp;
+		size_t size = SIZE_OF_HEAP_RT_SHM;
+		shm_rt = MALLOC(size);
+		registry_shm_mock = MALLOC(OBJ_SHM_REGISTRY_SIZE);
+		mock_registry = registry_new(registry_shm_mock,
+			-1, 1, mock_pop->pool_desc->nlanes);
+		mock_pop->registry = mock_registry;
+		heap_boot_env(&mock_pop->heap,
+			shm_rt, size, mock_pop->registry, 1);
+	} else {
+		mock_pop->pmem_lock = pmemobj_mutex_lock;
+		mock_pop->pmem_unlock = pmemobj_mutex_unlock;
+		heap_boot_env(&mock_pop->heap, NULL, 0, NULL, 1 /* init */);
+	}
 	heap_buckets_init(&mock_pop->heap);
 
 	/* initialize runtime lanes structure */
-	mock_pop->lanes_desc.runtime_nlanes = (unsigned)mock_pop->nlanes;
+	mock_pop->lanes_desc.runtime_nlanes =
+		(unsigned)mock_pop->pool_desc->nlanes;
+	mock_pop->lanes_desc.lane = MALLOC(OBJ_NLANES * sizeof(struct lane));
+	mock_pop->lanes_desc.lane_locks = ZALLOC(OBJ_NLANES * sizeof(uint64_t));
+	struct lane_range *range = MALLOC(sizeof(struct lane_range));
+	range->idx_start = 0;
+	range->idx_end = mock_pop->lanes_desc.runtime_nlanes - 1;
+	mock_pop->lane_range = range;
 	lane_boot(mock_pop);
 
 	UT_ASSERTne(mock_pop->heap.rt, NULL);
@@ -290,9 +356,17 @@ test_mock_pool_allocs(void)
 
 	lane_cleanup(mock_pop);
 	redo_log_config_delete(mock_pop->redo);
-	heap_cleanup(&mock_pop->heap);
+	heap_cleanup(&mock_pop->heap, mock_pop->mp_mode);
 
+	if (mock_pop->mp_mode) {
+		FREE(mock_pop->lanes_desc.lane);
+		FREE(mock_pop->lanes_desc.lane_locks);
+		FREE(shm_rt);
+		FREE(registry_shm_mock);
+		registry_delete(mock_registry, 1);
+	}
 	MUNMAP_ANON_ALIGNED(addr, MOCK_POOL_SIZE);
+	pmemobjpool_delete(mock_pop);
 }
 
 static void

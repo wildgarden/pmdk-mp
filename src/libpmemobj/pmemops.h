@@ -52,7 +52,6 @@ struct pmem_ops {
 	drain_fn drain;		/* drain function */
 	memcpy_fn memcpy_persist; /* persistent memcpy function */
 	memset_fn memset_persist; /* persistent memset function */
-
 	void *base;
 	size_t pool_size;
 
@@ -62,6 +61,7 @@ struct pmem_ops {
 		void *ctx;
 		uintptr_t base;
 	} remote;
+	void *base_p;
 };
 
 #ifdef _MSC_VER
