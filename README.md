@@ -1,3 +1,8 @@
+# Fork of the PMDK project
+This fork provides a protypical implemenation that supports multiple processes.
+The code can be found in the multi-process branch.
+
+
 pmdk: Persistent Memory Development Kit
 =======================================
 
